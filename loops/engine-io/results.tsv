@@ -1,0 +1,4 @@
+timestamp	trial	method	read_size_MB	num_reads	bandwidth_MBps	ms_per_expert	decision	notes
+2026-03-26T03:30	baseline	mmap_random	3.7	60	586	5.96	baseline	current llama.cpp approach
+2026-03-26T03:30	trial-1	explicit_unbuffered	3.7	60	2200	1.67	**BEST**	3.6x vs mmap, FILE_FLAG_NO_BUFFERING
+2026-03-26T03:30	trial-2	explicit_buffered	3.7	60	1184	3.10	keep	2.0x vs mmap, OS cache active

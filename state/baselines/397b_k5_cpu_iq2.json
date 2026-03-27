@@ -1,0 +1,53 @@
+{
+  "checkpoint": "397b-first-success",
+  "date": "2026-03-25T23:45:00",
+  "model": {
+    "name": "Qwen3.5-397B-A17B",
+    "quant": "UD-IQ2_XXS",
+    "source": "unsloth/Qwen3.5-397B-A17B-GGUF",
+    "shards": 4,
+    "disk_size_gb": 107,
+    "gguf_path": "D:/hf_cache/models--unsloth--Qwen3.5-397B-A17B-GGUF/snapshots/da33c16fa4440f831149fcf53b98a22bc07785e5/UD-IQ2_XXS/Qwen3.5-397B-A17B-UD-IQ2_XXS-00001-of-00004.gguf",
+    "architecture": "qwen35moe",
+    "num_layers": 60,
+    "num_experts": 512,
+    "default_expert_used_count": 10,
+    "shared_expert": true,
+    "hidden_size": 4096,
+    "expert_intermediate": 1024
+  },
+  "runtime": {
+    "engine": "llama-cpp-python",
+    "version": "0.3.18",
+    "backend": "CPU (no CUDA)",
+    "python": "3.13.1"
+  },
+  "hardware": {
+    "cpu": "laptop (Windows 11 Home)",
+    "gpu": "NVIDIA GeForce RTX 3070 Laptop GPU 8GB (NOT USED)",
+    "ram_gb": 39.7,
+    "ssd_model": "Samsung SSD 980 1TB",
+    "ssd_interface": "NVMe PCIe 3.0",
+    "ssd_measured_bandwidth_gbps": 2.1
+  },
+  "config": {
+    "K": 5,
+    "n_gpu_layers": 0,
+    "ctx": 512,
+    "max_tokens": 50,
+    "prompt": "What is quantum computing?"
+  },
+  "results": {
+    "ttft_ms": 9417,
+    "decode_tok_s": 1.00,
+    "ms_per_token": 1000,
+    "prompt_eval_tok_s": 0.53,
+    "total_time_s": 58.4,
+    "tokens_generated": 50
+  },
+  "k_sweep": {
+    "K10": {"decode_tok_s": 0.44, "ms_per_token": 2281, "ttft_ms": 14008},
+    "K7": {"decode_tok_s": 0.82, "ms_per_token": 1227, "ttft_ms": 10768},
+    "K5": {"decode_tok_s": 1.00, "ms_per_token": 1000, "ttft_ms": 9417}
+  }
+}

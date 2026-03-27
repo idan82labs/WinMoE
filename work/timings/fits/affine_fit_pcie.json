@@ -1,0 +1,11 @@
+{
+  "stage": "pcie_h2d_pinned",
+  "device": "RTX 3070 Laptop GPU (PCIe Gen 4 x16)",
+  "date": "2026-03-25",
+  "per_transfer_overhead_us": 11.0,
+  "asymptotic_bandwidth_MBps": 19000,
+  "asymptotic_bandwidth_GBps": 18.6,
+  "pageable_bandwidth_MBps": 7000,
+  "pageable_bandwidth_GBps": 6.8,
+  "notes": "Pinned memory mandatory. Measured from size sweep (4KB-128MB) and count sweep (1-1024 transfers)."
+}

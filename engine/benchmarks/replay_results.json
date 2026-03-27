@@ -1,0 +1,117 @@
+[
+  {
+    "K": 3,
+    "vram": 500,
+    "ram": 3000,
+    "label": "K=3, small cache",
+    "num_tokens": 307,
+    "mean_causal_ms": 461.770048917081,
+    "mean_overlap_ms": 427.20000000000016,
+    "p95_causal_ms": 521.6559631578949,
+    "p95_overlap_ms": 427.2000000000002,
+    "causal_tps": 2.165580037824341,
+    "overlap_tps": 2.3408239700374525,
+    "cache_stats": {
+      "vram_hits": 23865,
+      "ram_hits": 28432,
+      "ssd_misses": 2963,
+      "total": 55260,
+      "vram_hit_rate": 0.43186753528773075,
+      "ram_hit_rate": 0.5145132102786826,
+      "ssd_miss_rate": 0.05361925443358668,
+      "combined_cache_hit_rate": 0.9463807455664133
+    }
+  },
+  {
+    "K": 3,
+    "vram": 1000,
+    "ram": 5000,
+    "label": "K=3, medium cache",
+    "num_tokens": 307,
+    "mean_causal_ms": 451.83626744385407,
+    "mean_overlap_ms": 427.20000000000016,
+    "p95_causal_ms": 498.26238771929826,
+    "p95_overlap_ms": 427.2000000000002,
+    "causal_tps": 2.2131910872432603,
+    "overlap_tps": 2.3408239700374525,
+    "cache_stats": {
+      "vram_hits": 35611,
+      "ram_hits": 17186,
+      "ssd_misses": 2463,
+      "total": 55260,
+      "vram_hit_rate": 0.6444263481722765,
+      "ram_hit_rate": 0.3110025334781035,
+      "ssd_miss_rate": 0.04457111834961998,
+      "combined_cache_hit_rate": 0.95542888165038
+    }
+  },
+  {
+    "K": 3,
+    "vram": 1500,
+    "ram": 8000,
+    "label": "K=3, large cache",
+    "num_tokens": 307,
+    "mean_causal_ms": 444.3772721869823,
+    "mean_overlap_ms": 427.20000000000016,
+    "p95_causal_ms": 478.99143157894747,
+    "p95_overlap_ms": 427.2000000000002,
+    "causal_tps": 2.250340110956949,
+    "overlap_tps": 2.3408239700374525,
+    "cache_stats": {
+      "vram_hits": 43465,
+      "ram_hits": 9832,
+      "ssd_misses": 1963,
+      "total": 55260,
+      "vram_hit_rate": 0.7865544697792255,
+      "ram_hit_rate": 0.17792254795512125,
+      "ssd_miss_rate": 0.03552298226565328,
+      "combined_cache_hit_rate": 0.9644770177343467
+    }
+  },
+  {
+    "K": 5,
+    "vram": 1000,
+    "ram": 5000,
+    "label": "K=5, medium cache",
+    "num_tokens": 307,
+    "mean_causal_ms": 464.904286587805,
+    "mean_overlap_ms": 427.29272529858866,
+    "p95_causal_ms": 519.6324315789474,
+    "p95_overlap_ms": 427.2000000000002,
+    "causal_tps": 2.1509803820901814,
+    "overlap_tps": 2.340315996021716,
+    "cache_stats": {
+      "vram_hits": 54047,
+      "ram_hits": 35313,
+      "ssd_misses": 2740,
+      "total": 92100,
+      "vram_hit_rate": 0.586829533116178,
+      "ram_hit_rate": 0.38342019543973943,
+      "ssd_miss_rate": 0.02975027144408252,
+      "combined_cache_hit_rate": 0.9702497285559175
+    }
+  },
+  {
+    "K": 5,
+    "vram": 1500,
+    "ram": 8000,
+    "label": "K=5, large cache",
+    "num_tokens": 307,
+    "mean_causal_ms": 453.73501960112026,
+    "mean_overlap_ms": 427.20000000000016,
+    "p95_causal_ms": 503.5790017543859,
+    "p95_overlap_ms": 427.2000000000002,
+    "causal_tps": 2.2039295112797395,
+    "overlap_tps": 2.3408239700374525,
+    "cache_stats": {
+      "vram_hits": 67736,
+      "ram_hits": 22124,
+      "ssd_misses": 2240,
+      "total": 92100,
+      "vram_hit_rate": 0.7354614549402823,
+      "ram_hit_rate": 0.2402171552660152,
+      "ssd_miss_rate": 0.0243213897937025,
+      "combined_cache_hit_rate": 0.9756786102062975
+    }
+  }
+]

@@ -1,0 +1,42 @@
+[
+  {
+    "method": "mmap",
+    "total_bytes_MB": 6291.4554,
+    "total_time_ms": 10490.729999997711,
+    "mean_token_ms": 1049.0729999997711,
+    "bandwidth_MBps": 599.7156918537959,
+    "tok_s": 0.9532225116843329,
+    "projected_causal_tps": 0.6773814870285882,
+    "projected_overlap_tps": 0.9532225116843329
+  },
+  {
+    "method": "explicit_unbuffered",
+    "total_bytes_MB": 6291.4554,
+    "total_time_ms": 2821.776399985538,
+    "mean_token_ms": 282.1776399985538,
+    "bandwidth_MBps": 2229.6080582544546,
+    "tok_s": 3.543866905985624,
+    "projected_causal_tps": 1.4096863836898477,
+    "projected_overlap_tps": 2.3408239700374533
+  },
+  {
+    "method": "explicit+pinned+gpu",
+    "total_bytes_MB": 6291.4554,
+    "total_time_ms": 2888.809499978379,
+    "mean_token_ms": 288.8809499978379,
+    "bandwidth_MBps": 2177.871334211234,
+    "tok_s": 3.461633589918215,
+    "projected_causal_tps": 1.3964901593919226,
+    "projected_overlap_tps": 2.3408239700374533
+  },
+  {
+    "method": "pipelined_double_buffer+gpu",
+    "total_bytes_MB": 6291.4554,
+    "total_time_ms": 2886.0800999973435,
+    "mean_token_ms": 288.60800999973435,
+    "bandwidth_MBps": 2179.9309728118046,
+    "tok_s": 3.464907297621159,
+    "projected_causal_tps": 1.3970226457795172,
+    "projected_overlap_tps": 2.3408239700374533
+  }
+]

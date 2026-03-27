@@ -1,0 +1,4 @@
+trial_id	timestamp	change	K	n_gpu_layers	ctx	quant	decode_tps	prompt_tps	ms_per_token	decision	notes
+0	2026-03-25	baseline K=10	10	0	512	IQ2_XXS	0.44	0.36	2281	baseline	CPU-only first run
+1	2026-03-25	K=7	7	0	512	IQ2_XXS	0.82	0.46	1227	keep	1.9x vs baseline
+2	2026-03-25	K=5	5	0	512	IQ2_XXS	1.00	0.53	1000	keep	2.3x vs baseline

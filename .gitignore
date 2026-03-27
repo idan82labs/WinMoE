@@ -1,0 +1,22 @@
+# Build artifacts
+*.obj
+*.exe
+*.pdb
+*.ilk
+*.exp
+*.lib
+
+# Models (too large)
+*.gguf
+
+# IDE
+.vscode/
+.idea/
+
+# Claude internal
+.claude/
+
+# OS
+Thumbs.db
+Desktop.ini
+.DS_Store

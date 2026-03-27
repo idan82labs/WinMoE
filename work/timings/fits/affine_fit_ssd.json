@@ -1,0 +1,12 @@
+{
+  "alpha_s": 0.0,
+  "alpha_us": 0.0,
+  "beta_s": 4.1592e-05,
+  "beta_us": 41.59,
+  "B_bytes_per_s": 2220923972.0,
+  "B_MBps": 2118.0,
+  "B_GBps": 2.068,
+  "x_star_bytes": 0.0,
+  "x_star_KB": 0.0,
+  "num_points": 6
+}

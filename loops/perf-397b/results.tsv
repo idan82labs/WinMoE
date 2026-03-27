@@ -1,0 +1,9 @@
+K	ngl	threads	prompt	gen_tok_s	prompt_tok_s	quality_coherent	quality_factual	quality_structured	quality_verdict	notes
+3	8	12	quantum_computing	1.6	2.2	yes	yes	yes	GOOD	markdown formatting, covers superposition+entanglement, well-organized
+4	8	12	quantum_computing	1.5	1.6	yes	yes	yes	GOOD	very similar to K=3, slightly more verbose setup, same depth
+5	8	12	quantum_computing	1.4	1.3	yes	yes	yes	GOOD	marginally more detailed intro, same core content
+3	8	12	train_math	1.8	1.3	yes	yes	yes	GOOD	correctly identifies simultaneous departure assumption, begins step-by-step, uses LaTeX notation
+4	8	12	train_math	1.5	1.1	yes	yes	yes	GOOD	same approach as K=3, explicit variable naming, LaTeX, slightly more formal
+5	8	12	train_math	1.4	1.0	yes	yes	yes	GOOD	same quality as K=4, adds "clarify missing variable" preamble
+3	8	12	ipv4_code	1.6	2.0	yes	yes	yes	GOOD	correct implementation, docstring, handles edge cases (empty, leading zeros)
+5	8	12	ipv4_code	1.4	1.3	yes	yes	yes	GOOD	same logic as K=3, slightly more thorough docstring listing edge cases, adds strip()

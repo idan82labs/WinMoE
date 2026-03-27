@@ -1,0 +1,58 @@
+experiment	tok_s	sim_streamed_tps	bandwidth_MBps	per_expert_ms	cache_hit	status	notes
+v0.1_io_only	3.14	2.37	2011	1.77	0%	keep	baseline I/O benchmark, no cache, no compute
+v0.2_cache_seq	4.75	2.82	2011	1.64	28.9%	keep	sequential cache warmup, uniform random routing
+v0.3_zipf_routing	6.67	3.09	2011	1.75	52.3%	keep	Zipf routing + hotness-matched cache = 3.09 simulated!
+v0.4_dequant_scalar	0.44	0.44	N/A	4.18	N/A	keep	First working IQ2_XXS dequant+matmul! Scalar baseline. AVX512 next.
+v0.5_openmp_8t	2.37	2.21	2011	0.78	N/A	keep	OpenMP 8 threads, 0.78ms gate_proj. Compute-only 2.37 tok/s
+v0.6_avx2_omp8	2.90	2.70	2011	0.64	N/A	keep	AVX2 dequant + OpenMP 8 threads. 0.64ms gate_proj. 6.6x speedup!
+v0.7_avx2_omp10	3.24	3.02	2011	0.57	N/A	keep	AVX2+OpenMP 10 threads. 0.57ms gate. 3.24 compute, 3.02 projected. TARGET MET!
+v0.8_avx2_omp10_signtab	3.25-4.31	3.02-4.01	2011	0.43-0.62	N/A	keep	Precomputed sign table. Warm=0.43ms(4.31tps), cold=0.62ms(2.98tps). 3-4 tps ACHIEVED!
+v0.9_ffn_format_issue	12.87	N/A	N/A	0.43	N/A	reject	FFN outputs NaN — UD-IQ2_XXS block size=82 not 66. Need format reverse-engineering.
+v1.0_ffn_working	12.4	N/A	2011	0.44	N/A	keep	Expert FFN end-to-end working! NaN fixed. 0.44ms/expert. Sparse expert (82% zero).
+v1.1_dense_expert	9.22	8.64	2011	0.60	N/A	keep	Dense expert (94%). 0.60ms/expert. BUT: down_proj IQ1_M not correctly dequanted yet.
+v2.0_q4k_synthetic	3.81	N/A	N/A	0.27	N/A	keep	Q4_K_M dequant working! 35B: 3.81 tok/s, 397B: 2.54 tok/s. Synthetic data.
+v2.1_35b_q4_real	0.81-6.19	N/A	2011	0.17-1.29	N/A	keep	REAL 35B Q4_K_M data! Cold=0.81, warm=6.19 tok/s. GGUF parser + direct I/O + Q4_K dequant all working!
+v2.2_full_ffn_real	5.46	5.10	2011	0.572	N/A	keep	FULL EXPERT FFN on real 35B Q4_K_M! gate+up(Q4_K)+down(Q5_K)=0.572ms. 5.10 tok/s projected. TARGET 5 MET!
+v3.0_full_inference	0.92	N/A	2011	1089	N/A	keep	FIRST TOKENS FROM CUSTOM ENGINE! Full 40-layer forward pass. Token IDs wrong (need Q8/Q6K dequant). No cache yet.
+v3.1_embd_fixed	0.40	N/A	2011	2527	N/A	keep	Q8_0 embedding dequant correct. Token still id=0. Correctness debugging needed.
+v3.2_with_attn_proj	0.41	N/A	2011	2441	N/A	keep	Full 40-layer with QKV projections + MoE. Attention output zeroed (DeltaNet recurrence TBD). Diverse token IDs.
+v3.3_q8_dispatch_fixed	pending	N/A	N/A	N/A	N/A	keep	Q8_0 matvec dispatch added. L0 output correct (no NaN). Full forward pass running. 397B Q4 downloaded!
+v4.0_deltanet_real	0.74	N/A	N/A	1387	N/A	keep	REAL DeltaNet recurrence working! 32 per-head states, no NaN. Token ID=125697. 0.74 tok/s.
+v4.1_397b_attempt	0	N/A	N/A	OOM	N/A	reject	397B shared weight loading OOMs. Need lazy/streaming weight loading for 397B.
+v5.0_397b_first_token	0.05	N/A	2011	20448	N/A	keep	397B Q4_K_M FIRST TOKEN! 60 layers, 6 shards, 1098 tensors. No OOM. K=10, no cache, no LM head.
+v5.1_k4_profiled	0.39	N/A	2011	2552	N/A	keep	397B K=4. attn=676ms expert=1723ms router=150ms. Expert I/O dominates 67.5%.
+v5.2_expert_cache	0.67	N/A	2011	1486	94.4%	keep	397B K=4 + expert cache. 94.4% hit! expert=677ms attn=657ms. 0.67 tok/s!
+v5.3_router_prealloc	0.66	N/A	N/A	1522	94.4%	keep	397B K=4 + cache + router opt + prealloc. No change vs v5.2 — compute-bound now.
+v5.4_avx2_kernels	0.85	N/A	N/A	1176	94.4%	keep	397B AVX2 Q4_K+Q8_0 kernels. attn=466ms expert=553ms. 0.85 tok/s!
+v5.5_avx2_router	0.94	N/A	N/A	1065	94.4%	keep	397B AVX2 FP32 router. router=23ms (was 153ms). 0.94 tok/s!
+v5.7_bugfix_correct	0.67	N/A	N/A	1492	53.8%	keep	397B buffer bug FIXED. Diverse tokens! But cache hit 53.8% (was artificial 94.4%). Correct perf: 0.67 tok/s
+v5.8_state_avx2	0.75	N/A	N/A	1337	53.8%	keep	AVX2 fused state ops. attn=459ms(-53) expert=860ms(-95). Row-broadcast FMA. 0.75 tok/s
+v5.9_fpfast	0.74	N/A	N/A	1352	53.8%	keep	/fp:fast flag. Negligible change. attn=465 expert=871. Same correct tokens.
+v6.0_q5k_avx2	0.79	N/A	N/A	1270	53.8%	keep	Q5_K AVX2 rewrite. expert=745ms(-126). 0.79 tok/s. Same correct tokens.
+v6.1_small_vec	0.78	N/A	N/A	1277	53.8%	keep	RMSNorm+accum AVX2. ~same as v6.0. expert=746 attn=509. Noise-level improvement.
+v6.2_20tok_warmup	0.79	N/A	N/A	1272	60.1%	keep	20 tokens. Cache warms to 60%. Best token 1272ms=0.79. High variance (680ms-4359ms expert).
+v6.3_avx512	0.91	N/A	N/A	1099	53.8%	keep	AVX-512 Q4_K+Q5_K+Q8_0! expert=596(-149) attn=479(-23). 0.91 tok/s! 18.2x from v5.0
+v6.4_int_accum	1.01	N/A	N/A	987	29.6%	keep	Q4_K integer accumulation! Token2=987ms(1.01tps!) expert=491ms when cached. New routing changes tokens+cache.
+v6.5_q5k_int_fusion	1.39	N/A	N/A	719	73.2%	keep	Q5K integer + gate/up pre-quant fusion! expert=208ms(was 491)! 1.39 tok/s! 27.8x from v5.0!
+v6.6_q8_int_10tok	1.52	N/A	N/A	660	83.8%	keep	Q8_0 integer + 10 tokens. Peak 660ms=1.52tps! expert=173ms attn=454ms. 30.4x from v5.0!
+v6.7_async_io	1.49	N/A	N/A	670	83.8%	keep	Async overlapped I/O. Cold start expert 1344ms(-169). Warm tokens ~same. 1.49 tok/s peak.
+v7.0_vnni_q8	1.53	N/A	N/A	655	83.8%	keep	VNNI dpbusd for Q8_0. Modest gain: attn=455(-13ms). Memory-bandwidth-bound, not ALU-bound.
+v7.1_gpu_35b	15.9	N/A	N/A	63	83.8%	keep	35B GPU DeltaNet: 63ms/tok=15.9tps! DeltaNet 28ms. GPU WORKS!
+v7.2_gpu_397b_oom	1.18	N/A	N/A	680	95.0%	partial	397B GPU: VRAM overflow (11.5GB>8GB). cuBLAS errors but still runs. Need Q8_0 on GPU or partial offload.
+v7.4_gpu_q8_opt	2.60	N/A	N/A	384	79.2%	keep	397B GPU Q8_0 optimized (256 threads/row). DeltaNet=176ms! 2.60 tok/s peak! 52x from v5.0!
+v7.5_phase3_pipeline	2.78	N/A	N/A	360	79.2%	keep	Phase 3 async pipeline. 3 CUDA streams + double-buffered pinned memory. DeltaNet=151ms(-25). 2.78 tok/s!
+v7.6_vnni_expert	2.55	N/A	N/A	393	79.0%	reject	VNNI dpbusd for Q4_K/Q5_K expert. NO improvement — hsum overhead negates dpbusd gain. Revert.
+v7.7_avx512_q4k_int	2.11	N/A	N/A	474	83.2%	reject	AVX-512 Q4_K integer: SLOWER. Nibble layout mismatch + expensive set_epi16 for scales. Reverted.
+v7.8_multirow	2.73	N/A	N/A	366	79.2%	reject	Multi-row Q4_K blocking: no improvement. Activation already in L1 cache.
+v7.9_prefetch	2.75	N/A	N/A	363	79.2%	reject	Software prefetch: no improvement. HW prefetcher already handles sequential access.
+v8.0_fused_swiglu	2.87	N/A	N/A	349	82.5%	keep	Fused gate+up kernel + AVX2 SwiGLU. expert=174ms(-8). 2.87 tok/s peak. 57.4x from v5.0!
+v8.1_thread_sweep	2.58	N/A	N/A	387	-	reject	Thread sweep: 10 threads still optimal. 4-8 threads all worse.
+v8.2_prefetch_prealloc	2.80	N/A	N/A	357	82.5%	reject	Prefetch + pre-alloc Q5_K down: no meaningful change vs v8.0.
+v8.3_gpu_expert_cache	3.18	N/A	N/A	314	43.6%	keep	GPU expert cache! Token 9=314ms(3.18tps)! DeltaNet=116ms expert=172ms. GPU cache warming.
+v8.4_gpu_expert_20tok	3.19	N/A	N/A	314	60.2%	keep	20 tokens. Token19=314ms(3.19tps). DeltaNet=118ms expert=167ms. GPU cache warming steady.
+v8.5_gpu_150_limit	3.31	N/A	N/A	302	68.3%	keep	GPU expert cache capped at 150. Token9=302ms(3.31tps)! Less VRAM pressure = faster. 66.2x from v5.0!
+v8.6_limit_sweep	3.36	N/A	N/A	298	-	keep	GPU expert limit sweep: 150 optimal. Token9=298ms(3.36tps). 67.2x from v5.0!
+v8.7_gpu_router	0.67	N/A	N/A	787	38.1%	reject	GPU router: saves 20ms but costs 480MB VRAM → worse expert caching → net slower. Reverted.
+v8.8_k3	4.44	N/A	N/A	225	-	keep	K=3. Token8=225ms(4.44tps)! Expert=83ms(-47%). DeltaNet=115ms. 88.8x from v5.0!
+v8.9_gpu_shmem	4.37	N/A	N/A	229	51.5%	keep	GPU Q8_0 shared memory input cache. DeltaNet=64ms(-51ms, 1.8x)! 4.37 tok/s K=4! 87.4x!
+v9.0_fused_expert	4.70	N/A	N/A	213	67.5%	keep	Fused GPU expert (gate+up+swiglu+down all on GPU, pre-alloc buffers, Q5_K shmem fix). Peak=212.6ms(4.70tps)! Avg warm=229ms(4.36tps). Expert=44-71ms(-50% for cached). DeltaNet=133-152ms (stream contention). 94x from v5.0!

@@ -1,0 +1,77 @@
+#pragma once
+/*
+ * GPU Offload API — Phase 3 Pipeline Architecture
+ *
+ * Sync API (backward compatible):
+ *   gpu_deltanet_projections() — blocking QKV+Gate
+ *   gpu_ssm_out_projection() — blocking SSM Out
+ *
+ * Async API (Phase 3 pipeline):
+ *   gpu_launch_qkv_gate() → gpu_wait_qkv_gate() — non-blocking launch, explicit wait
+ *   gpu_launch_ssm_out() → gpu_wait_ssm_out() — same pattern
+ *   gpu_get_qkv_out() / gpu_get_gate_out() — access pinned result buffers
+ */
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+int gpu_init(void);
+void gpu_shutdown(void);
+int gpu_is_initialized(void);
+float gpu_vram_used_mb(void);
+
+/* Upload Q8_0 DeltaNet weights to GPU */
+int gpu_upload_deltanet_weights(int layer,
+    const void* qkv_q8, int qkv_rows, int qkv_cols,
+    const void* gate_q8, int gate_rows, int gate_cols,
+    const void* ssm_out_q8, int ssm_rows, int ssm_cols);
+
+/* Sync API (blocking) */
+int gpu_deltanet_projections(int layer,
+    const float* normed, int hidden_dim,
+    float* qkv_out, int qkv_dim,
+    float* gate_out, int gate_dim);
+
+int gpu_ssm_out_projection(int layer,
+    const float* gated, int gated_dim,
+    float* output, int output_dim);
+
+/* Async API (non-blocking) — Phase 3 pipeline */
+int gpu_launch_qkv_gate(int layer, int slot,
+    const float* normed, int hidden_dim,
+    int qkv_dim, int gate_dim);
+int gpu_wait_qkv_gate(int slot);
+
+int gpu_launch_ssm_out(int layer, int slot,
+    const float* gated, int gated_dim, int output_dim);
+int gpu_wait_ssm_out(int slot);
+
+/* Access pinned result buffers after wait */
+float* gpu_get_qkv_out(int slot);
+float* gpu_get_gate_out(int slot);
+float* gpu_get_ssm_out_buf(int slot);
+
+/* GPU Router */
+int gpu_upload_router(int layer, const float* weights, int hidden_dim, int num_experts);
+int gpu_router(int layer, const float* normed, int hidden_dim, float* logits_out, int num_experts);
+
+/* GPU Expert Cache — hot experts computed on GPU at 256 GB/s */
+int gpu_cache_expert(int layer, int expert_id,
+    const void* gate_data, int gate_size,
+    const void* up_data, int up_size,
+    const void* down_data, int down_size);
+int gpu_find_cached_expert(int layer, int expert_id);
+int gpu_expert_ffn(int cache_idx, const float* input, int hidden_dim,
+    int intermediate, float* gate_out, float* up_out, float* expert_out,
+    int gate_type, int down_type);
+int gpu_expert_down(int cache_idx, const float* act, int intermediate,
+    float* output, int hidden_dim);
+/* Fully fused: gate+up+swiglu+down all on GPU, single upload/download */
+int gpu_expert_ffn_fused(int cache_idx, const float* input, int hidden_dim,
+    int intermediate, float* expert_out);
+int gpu_expert_cache_count(void);
+
+#ifdef __cplusplus
+}
+#endif

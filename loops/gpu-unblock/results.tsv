@@ -1,0 +1,27 @@
+timestamp	trial	mode	cuda_active	n_gpu_layers	K	cache_state	ttft_ms	tok_s	ms_per_token	decision	notes
+2026-03-26T01:10	cpu-baseline	CPU-only llama-cpp-python	no	0	5	warm	7504	1.22	821	baseline	frozen CPU baseline, verified reproducible
+2026-03-26T02:10	cuda-ngl5	llama-cli CUDA	yes	5	5	warm	N/A	1.0	1000	keep	first CUDA run, matched CPU baseline
+2026-03-26T02:12	cuda-ngl6	llama-cli CUDA	yes	6	5	warm	N/A	1.1	909	keep	slight improvement
+2026-03-26T02:14	cuda-ngl7	llama-cli CUDA	yes	7	5	warm	N/A	1.2	833	keep	good improvement
+2026-03-26T02:16	cuda-ngl8	llama-cli CUDA	yes	8	5	warm	N/A	1.3	769	**BEST**	+6.6% vs CPU baseline. Sweet spot for 8GB VRAM.
+2026-03-26T02:18	cuda-ngl9	llama-cli CUDA	yes	9	5	warm	N/A	1.1	909	reject	regression from ngl=8
+2026-03-26T02:20	cuda-ngl10	llama-cli CUDA	yes	10	5	warm	N/A	1.2	833	reject	below ngl=8
+2026-03-26T02:22	cuda-ngl11	llama-cli CUDA	yes	11	5	warm	N/A	1.1	909	reject	below ngl=8
+2026-03-26T02:24	cuda-ngl12	llama-cli CUDA	yes	12	5	warm	N/A	1.0	1000	reject	VRAM overflow starting, regression
+2026-03-26T02:26	cuda-ngl15	llama-cli CUDA	yes	15	5	warm	N/A	1.0	1000	reject	heavy VRAM overflow (26GB requested), fully degraded
+2026-03-26T02:30	cuda-K4-ngl8	llama-cli CUDA	yes	8	4	warm	N/A	1.3	769	keep	K=4+ngl=8 combined
+2026-03-26T02:32	cuda-K3-ngl8	llama-cli CUDA	yes	8	3	warm	N/A	1.4	714	keep	K=3+ngl=8
+2026-03-26T02:34	cuda-K2-ngl8	llama-cli CUDA	yes	8	2	warm	N/A	1.6	625	keep	K=2+ngl=8, prompt=2.6
+2026-03-26T02:36	cuda-K3-ngl8-t4	llama-cli CUDA	yes	8	3	warm	N/A	1.1	909	reject	threads=4 too few
+2026-03-26T02:37	cuda-K3-ngl8-t6	llama-cli CUDA	yes	8	3	warm	N/A	1.4	714	keep	threads=6
+2026-03-26T02:38	cuda-K3-ngl8-t8	llama-cli CUDA	yes	8	3	warm	N/A	1.4	714	keep	threads=8
+2026-03-26T02:39	cuda-K3-ngl8-t12	llama-cli CUDA	yes	8	3	warm	N/A	1.5	667	**BEST-K3**	threads=12, prompt=2.2
+2026-03-26T02:40	cuda-K3-ngl8-t16	llama-cli CUDA	yes	8	3	warm	N/A	1.5	667	keep	threads=16 same as 12
+2026-03-26T02:41	cuda-K3-ngl8-t12-fa	llama-cli CUDA	yes	8	3	warm	N/A	1.5	667	reject	flash-attn=on, no improvement
+2026-03-26T02:42	cuda-K3-batch-sweep	llama-cli CUDA	yes	8	3	warm	N/A	1.5	667	reject	batch 64-1024 all same
+2026-03-26T02:45	cuda-K2-ngl8-t12	llama-cli CUDA	yes	8	2	warm	N/A	1.6	625	**BEST-SPEED**	K=2 max speed, prompt=2.8
+2026-03-26T02:50	cuda-K3-ngl8-t12-warmed	llama-cli CUDA	yes	8	3	warm-full	N/A	1.5	667	keep	full 115GB cache warm, same as partial warm
+2026-03-26T02:52	cuda-K3-ubatch-sweep	llama-cli CUDA	yes	8	3	warm	N/A	1.5	667	reject	ubatch 32-256 all same, no impact
+2026-03-26T02:55	cuda-K3-multi-prompt	llama-cli CUDA	yes	8	3	warm	N/A	1.5	667	keep	stable 1.4-1.6 across 4 diverse prompts
+2026-03-26T02:58	cuda-K3-200tok	llama-cli CUDA	yes	8	3	warm	N/A	1.7	588	**BEST-SUSTAINED**	200 tokens, throughput IMPROVES with length (cache warming effect)
+2026-03-26T03:05	cuda-K3-500tok	llama-cli CUDA	yes	8	3	warm	N/A	1.7	588	keep	500 tokens ctx=1024, sustained 1.7 tok/s, stable

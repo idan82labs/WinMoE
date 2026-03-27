@@ -1,0 +1,4 @@
+trial_id	timestamp	change_summary	baseline_ref	candidate_ref	command	primary_metric	guardrails	status	decision	lesson_ref
+0	2026-03-25T18:00	establish baseline: explicit unbuffered reads via Win32 CreateFileW	N/A	explicit_unbuffered_64MB	io_benchmark.py --drive D: --size-mb 512	2853 MB/s seq, 42 us/req overhead	correctness: data read matches	done	keep as baseline	timing-analysis-001.md
+1	2026-03-25T18:00	candidate: explicit buffered (OS-cached) reads	trial_0	explicit_buffered_256KB	io_benchmark.py --drive D: --size-mb 512	6774 MB/s seq (OS cache)	N/A - reads from page cache	done	reject	OS page cache speed; not real SSD; misleading for cold expert loads >> RAM
+2	2026-03-25T18:00	candidate: mmap sequential access	trial_0	mmap_sequential_256KB	io_benchmark.py --drive D: --size-mb 512	1091 MB/s seq (cached)	N/A - page cache	done	reject	Page-cache illusion; will thrash catastrophically for workloads >> RAM; no async control

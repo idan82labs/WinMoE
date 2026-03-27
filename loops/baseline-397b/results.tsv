@@ -1,0 +1,5 @@
+timestamp	trial	change	baseline_ref	result_ref	K	cache_state	mode	ttft_ms	tok_s	ms_per_token	decision	notes
+2026-03-26T00:10	baseline	K=5 warm cache CPU-only	N/A	N/A	5	warm	CPU	7519	1.22	821	baseline	frozen baseline
+2026-03-26T00:50	trial-1	reproducibility rerun	baseline	trial-1	5	warm	CPU	7504	1.22	821	keep	reproduces exactly: 1.22 tok/s, 821 ms/tok, TTFT 7504ms
+2026-03-26T00:55	trial-2	K=6	baseline	trial-2	6	warm	CPU	8027	1.15	866	reject	-5.7% tok/s vs baseline. Quality gain unverified. Not worth the speed loss without quality evidence.
+2026-03-26T01:05	trial-3	CUDA llama.cpp build	baseline	trial-3	5	warm	N/A	N/A	N/A	N/A	blocked	No CUDA toolkit, no MSVC compiler, no pre-built CUDA wheel for cp313/win. Need: CUDA toolkit + VS Build Tools.

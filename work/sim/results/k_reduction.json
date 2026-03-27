@@ -1,0 +1,82 @@
+[
+  {
+    "K": 2,
+    "retained_mass": 0.5121,
+    "miss_mb_per_layer": 12.6,
+    "ssd_miss_pct": 10.02,
+    "mean_service_ms": 0.842,
+    "p95_service_ms": 3.697,
+    "rho": 0.168,
+    "status": "VIABLE"
+  },
+  {
+    "K": 3,
+    "retained_mass": 0.6259,
+    "miss_mb_per_layer": 18.9,
+    "ssd_miss_pct": 12.06,
+    "mean_service_ms": 1.464,
+    "p95_service_ms": 4.039,
+    "rho": 0.293,
+    "status": "VIABLE"
+  },
+  {
+    "K": 4,
+    "retained_mass": 0.7113,
+    "miss_mb_per_layer": 25.2,
+    "ssd_miss_pct": 13.23,
+    "mean_service_ms": 2.115,
+    "p95_service_ms": 6.709,
+    "rho": 0.423,
+    "status": "VIABLE"
+  },
+  {
+    "K": 5,
+    "retained_mass": 0.7796,
+    "miss_mb_per_layer": 31.5,
+    "ssd_miss_pct": 14.12,
+    "mean_service_ms": 2.805,
+    "p95_service_ms": 7.051,
+    "rho": 0.561,
+    "status": "VIABLE"
+  },
+  {
+    "K": 6,
+    "retained_mass": 0.8365,
+    "miss_mb_per_layer": 37.7,
+    "ssd_miss_pct": 15.05,
+    "mean_service_ms": 3.559,
+    "p95_service_ms": 7.736,
+    "rho": 0.712,
+    "status": "VIABLE"
+  },
+  {
+    "K": 7,
+    "retained_mass": 0.8852,
+    "miss_mb_per_layer": 44.0,
+    "ssd_miss_pct": 15.84,
+    "mean_service_ms": 4.355,
+    "p95_service_ms": 10.406,
+    "rho": 0.871,
+    "status": "VIABLE"
+  },
+  {
+    "K": 8,
+    "retained_mass": 0.9279,
+    "miss_mb_per_layer": 50.3,
+    "ssd_miss_pct": 16.46,
+    "mean_service_ms": 5.161,
+    "p95_service_ms": 10.748,
+    "rho": 1.032,
+    "status": "MARGINAL"
+  },
+  {
+    "K": 10,
+    "retained_mass": 1.0,
+    "miss_mb_per_layer": 62.9,
+    "ssd_miss_pct": 17.68,
+    "mean_service_ms": 6.9,
+    "p95_service_ms": 14.103,
+    "rho": 1.38,
+    "status": "MARGINAL"
+  }
+]

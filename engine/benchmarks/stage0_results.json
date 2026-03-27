@@ -1,0 +1,31 @@
+{
+  "stage": 0,
+  "model": "Qwen3.5-397B-A17B-IQ2_XXS",
+  "K": 3,
+  "n_gpu_layers": 8,
+  "threads": 12,
+  "inference": {
+    "eval_ms_per_token": 769.2307692307692,
+    "eval_tps": 1.3,
+    "prompt_tps": 1.4
+  },
+  "breakdown": {
+    "ms_per_layer": 12.82,
+    "ssd_read_ms": 5.12,
+    "pcie_transfer_ms": 0.58,
+    "compute_ms": 7.12,
+    "expert_bytes_per_layer": 10485759,
+    "expert_bytes_per_token": 629145540,
+    "ssd_utilization_pct": 39.9
+  },
+  "mmap": {
+    "mmap_50_experts_ms": 280.2,
+    "mmap_bytes_read": 174762650,
+    "mmap_bandwidth_MBps": 624.0
+  },
+  "calibration": {
+    "ssd_bandwidth_GBps": 2.1,
+    "pcie_bandwidth_GBps": 19.0,
+    "expert_block_size_MB": 3.495253
+  }
+}

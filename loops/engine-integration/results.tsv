@@ -1,0 +1,25 @@
+trial	threads	ngl	K	tokens	gen_tps	prompt_tps	notes
+thread_4	4	0	3	50	1.3	0.7	CPU-only source-built
+thread_8	8	0	3	50	1.6	1.0	CPU-only source-built
+thread_12	12	0	3	50	1.7	1.1	CPU-only source-built
+thread_16	16	0	3	50	1.7	1.6	CPU-only source-built
+len_20	12	0	3	20	1.7	1.4	CPU source-built length test
+len_50	12	0	3	50	1.7	1.1	CPU source-built length test
+len_100	12	0	3	100	1.6	1.4	CPU source-built length test
+len_200	12	0	3	200	1.8	1.4	CPU source-built length test
+K_2	12	0	2	50	1.7	1.4	CPU source-built K test
+K_3	12	0	3	50	1.7	1.1	CPU source-built K test
+K_4	12	0	4	50	1.7	1.1	CPU source-built K test
+K_5	12	0	5	50	1.5	1.4	CPU source-built K test
+ctx_256	12	0	3	50	1.5	1.4	CPU source-built ctx test
+ctx_512	12	0	3	50	1.7	1.1	CPU source-built ctx test
+ctx_1024	12	0	3	50	1.7	1.1	CPU source-built ctx test
+ctx_2048	12	0	3	50	1.8	1.1	CPU source-built ctx test
+best_combo	16	0	3	200	1.8	2.0	Best combo: K3 t16 ctx2048 200tok
+sustained_500	16	0	3	500	1.8	1.9	500tok sustained
+bs_128	16	0	3	100	1.6		batch=128
+bs_256	16	0	3	100	1.7		batch=256
+bs_512	16	0	3	100	1.6		batch=512
+bs_1024	16	0	3	100	1.8		batch=1024
+prebuilt_cuda_ngl8	12	8	3	200	1.7	1.7	Pre-built CUDA ngl=8 ctx=2048
+prebuilt_cuda_ngl0	12	0	3	200	1.5	1.5	Pre-built CUDA CPU-only ctx=2048

@@ -1,0 +1,17 @@
+'vswhere.exe' is not recognized as an internal or external command,
+operable program or batch file.
+**********************************************************************
+** Visual Studio 2022 Developer Command Prompt v17.0
+** Copyright (c) 2022 Microsoft Corporation
+**********************************************************************
+[vcvarsall.bat] Environment initialized for: 'x64'
+Microsoft (R) C/C++ Optimizing Compiler Version 19.36.32532 for x64
+Copyright (C) Microsoft Corporation.  All rights reserved.
+
+slab_reader_bench.cpp
+Microsoft (R) Incremental Linker Version 14.36.32532.0
+Copyright (C) Microsoft Corporation.  All rights reserved.
+
+/out:slab_reader_bench.exe 
+slab_reader_bench.obj 
+BUILD DONE

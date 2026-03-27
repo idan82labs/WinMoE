@@ -1,0 +1,10 @@
+timestamp	model	quant	mode	K	prompt_id	ttft_ms	tok_s	ms_per_token	notes
+2026-03-25T23:30	Qwen3.5-397B-A17B	IQ2_XXS	CPU	10	quantum_computing	14008	0.44	2281	baseline K=10, n_gpu_layers=0, ctx=512, 49 decode tokens
+2026-03-25T23:38	Qwen3.5-397B-A17B	IQ2_XXS	CPU	7	quantum_computing	10768	0.82	1227	GGUF patched expert_used_count=7, same config otherwise
+2026-03-25T23:45	Qwen3.5-397B-A17B	IQ2_XXS	CPU	5	quantum_computing	9417	1.00	1000	GGUF patched expert_used_count=5, COLD cache
+2026-03-26T00:10	Qwen3.5-397B-A17B	IQ2_XXS	CPU	5	quantum_computing	7519	1.22	821	warm page cache re-test, n_gpu_layers=0
+2026-03-26T00:12	Qwen3.5-397B-A17B	IQ2_XXS	CPU	5	quantum_computing	7446	1.24	806	n_gpu_layers=5 (no effect, CPU-only build), warm cache
+2026-03-26T00:20	Qwen3.5-397B-A17B	IQ2_XXS	CPU	4	quantum_computing	6664	1.31	763	K=4, warm cache
+2026-03-26T00:25	Qwen3.5-397B-A17B	IQ2_XXS	CPU	6	quantum_computing	8127	1.15	870	K=6, warm cache
+2026-03-26T00:30	Qwen3.5-397B-A17B	IQ2_XXS	CPU	8	quantum_computing	9603	0.85	1181	K=8, warm cache
+2026-03-26T00:35	Qwen3.5-397B-A17B	IQ2_XXS	CPU	5	quantum_computing	7632	1.25	797	ctx=256 (vs 512), warm cache, negligible difference
