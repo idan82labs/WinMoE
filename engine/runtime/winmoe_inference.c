@@ -275,6 +275,10 @@ static int load_shared_weights(const char* gguf_path, GGUFModel* model,
             snprintf(name, 256, "blk.%d.ssm_norm.weight", l);
             t = find_tensor(model, name);
             if (t) { layers[l].ssm_norm_w = (float*)load_tensor_data(model, t, &size); }
+
+            snprintf(name, 256, "blk.%d.ssm_conv1d.weight", l);
+            t = find_tensor(model, name);
+            if (t) { layers[l].ssm_conv1d_w = (float*)load_tensor_data(model, t, &size); }
         } else {
             layers[l].is_deltanet = 0;
             /* Standard attention layer (every 4th) */
@@ -450,14 +454,14 @@ int main(int argc, char** argv) {
     printf("MoE: %d experts, K=%d active\n", cfg.num_experts, cfg.expert_k);
     printf("Tokens to generate: %d\n\n", num_tokens);
 
-    /* DEBUG: scan for shared expert tensors */
+    /* DEBUG: scan for conv and other tensors */
     {
         int ti;
         for (ti = 0; ti < (int)model.n_tensors; ti++) {
-            if (strstr(model.tensors[ti].name, "shexp") ||
-                strstr(model.tensors[ti].name, "shared") ||
-                strstr(model.tensors[ti].name, "ffn_gate_sh") ||
-                (strstr(model.tensors[ti].name, "blk.0.ffn") && !strstr(model.tensors[ti].name, "exps") && !strstr(model.tensors[ti].name, "inp"))) {
+            if ((strstr(model.tensors[ti].name, "blk.0.") &&
+                (strstr(model.tensors[ti].name, "conv") || strstr(model.tensors[ti].name, "ssm_dt") ||
+                 strstr(model.tensors[ti].name, "ssm_D"))) ||
+                0) {
                 fprintf(stderr, "TENSOR: %s  dims=[%llu,%llu] type=%d\n",
                     model.tensors[ti].name,
                     (unsigned long long)model.tensors[ti].dims[0],
@@ -598,10 +602,31 @@ int main(int argc, char** argv) {
             }
             if (layers[i].is_deltanet && layers[i].w_qkv) {
                 if (i == 0) {
-                    char tn[256]; snprintf(tn, 256, "blk.0.attn_qkv.weight");
+                    char tn[256];
+                    snprintf(tn, 256, "blk.0.attn_qkv.weight");
                     TensorInfo* tqkv = find_tensor(&model, tn);
                     if (tqkv) fprintf(stderr, "  DeltaNet QKV dims=[%llu,%llu] type=%d\n",
                         (unsigned long long)tqkv->dims[0], (unsigned long long)tqkv->dims[1], tqkv->type);
+                    snprintf(tn, 256, "blk.0.attn_gate.weight");
+                    TensorInfo* tg = find_tensor(&model, tn);
+                    if (tg) fprintf(stderr, "  DeltaNet Gate dims=[%llu,%llu]\n",
+                        (unsigned long long)tg->dims[0], (unsigned long long)tg->dims[1]);
+                    snprintf(tn, 256, "blk.0.ssm_alpha.weight");
+                    TensorInfo* ta = find_tensor(&model, tn);
+                    if (ta) fprintf(stderr, "  DeltaNet Alpha dims=[%llu,%llu]\n",
+                        (unsigned long long)ta->dims[0], (unsigned long long)ta->dims[1]);
+                    snprintf(tn, 256, "blk.0.ssm_a");
+                    TensorInfo* tssa = find_tensor(&model, tn);
+                    if (tssa) fprintf(stderr, "  DeltaNet ssm_a dims=[%llu,%llu]\n",
+                        (unsigned long long)tssa->dims[0], (unsigned long long)tssa->dims[1]);
+                    snprintf(tn, 256, "blk.0.ssm_out.weight");
+                    TensorInfo* tso = find_tensor(&model, tn);
+                    if (tso) fprintf(stderr, "  DeltaNet SSM_Out dims=[%llu,%llu]\n",
+                        (unsigned long long)tso->dims[0], (unsigned long long)tso->dims[1]);
+                    snprintf(tn, 256, "blk.0.ssm_norm.weight");
+                    TensorInfo* tsn = find_tensor(&model, tn);
+                    if (tsn) fprintf(stderr, "  DeltaNet SSM_Norm dims=[%llu]\n",
+                        (unsigned long long)tsn->dims[0]);
                 }
                 /* Upload Q8_0 weights → GPU
                  * QKV: [hidden, 12288] = Q(2048) + K(2048) + V(8192)
@@ -819,6 +844,23 @@ int main(int argc, char** argv) {
                     float* gpu_qkv = gpu_get_qkv_out(slot_idx);
                     float* gpu_gate = gpu_get_gate_out(slot_idx);
 
+                    /* Apply conv1d to QKV before state recurrence */
+                    if (lw->ssm_conv1d_w) {
+                        DeltaNetState* ds = &dn_states[layer];
+                        int conv_slot = ds->conv_pos % DN_CONV_WIDTH;
+                        memcpy(ds->conv_buf + conv_slot * DN_QKV_DIM, gpu_qkv, DN_QKV_DIM * sizeof(float));
+                        ds->conv_pos++;
+                        for (i = 0; i < DN_QKV_DIM; i++) {
+                            float sum = 0.0f;
+                            for (int k = 0; k < DN_CONV_WIDTH; k++) {
+                                int hs = ((ds->conv_pos - 1 - k) % DN_CONV_WIDTH + DN_CONV_WIDTH) % DN_CONV_WIDTH;
+                                sum += lw->ssm_conv1d_w[k * DN_QKV_DIM + i] * ds->conv_buf[hs * DN_QKV_DIM + i];
+                            }
+                            float sig = 1.0f / (1.0f + expf(-sum));
+                            gpu_qkv[i] = sum * sig; /* SiLU */
+                        }
+                    }
+
                     /* CPU: DeltaNet state recurrence using GPU's QKV output */
                     /* QKV split: Q[2048] + K[2048] + V[8192] = 12288 */
                     float* Q = gpu_qkv;
@@ -937,6 +979,7 @@ int main(int argc, char** argv) {
                         lw->w_alpha, lw->w_alpha_type,
                         lw->w_beta, lw->w_beta_type,
                         lw->w_ssm_out, lw->w_ssm_out_type,
+                        lw->ssm_conv1d_w,
                         lw->ssm_a, lw->ssm_dt_bias, lw->ssm_norm_w,
                         H
                     );

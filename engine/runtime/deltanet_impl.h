@@ -126,6 +126,8 @@ static void deltanet_forward(
     const void* w_alpha, int w_alpha_type,
     const void* w_beta, int w_beta_type,
     const void* w_out, int w_out_type,
+    /* Conv1d weight [4, 12288] FP32 */
+    const float* conv1d_w,
     /* Learned parameters */
     const float* a_log,
     const float* dt_bias,
@@ -148,6 +150,29 @@ static void deltanet_forward(
 
     if (w_beta) quant_matvec(beta_raw, w_beta, x, DN_NUM_GATES, hidden_dim, w_beta_type);
     else memset(beta_raw, 0, DN_NUM_GATES * sizeof(float));
+
+    /* 1b. Conv1d: depthwise causal convolution on QKV [kernel=4, channels=12288]
+     * For autoregressive: sliding window of last 4 QKV vectors.
+     * conv_out[ch] = sum_k(conv_weight[k][ch] * qkv_history[(pos-k) % 4][ch])
+     * conv_weight is [4, 12288] FP32. */
+    if (state->conv_buf && conv1d_w) {
+        /* Store current QKV in circular buffer */
+        int conv_slot = state->conv_pos % DN_CONV_WIDTH;
+        memcpy(state->conv_buf + conv_slot * DN_QKV_DIM, qkv, DN_QKV_DIM * sizeof(float));
+        state->conv_pos++;
+
+        /* Apply depthwise conv1d with SiLU activation */
+        for (i = 0; i < DN_QKV_DIM; i++) {
+            float sum = 0.0f;
+            for (int k = 0; k < DN_CONV_WIDTH; k++) {
+                int hist_slot = ((state->conv_pos - 1 - k) % DN_CONV_WIDTH + DN_CONV_WIDTH) % DN_CONV_WIDTH;
+                sum += conv1d_w[k * DN_QKV_DIM + i] * state->conv_buf[hist_slot * DN_QKV_DIM + i];
+            }
+            /* SiLU activation: x * sigmoid(x) */
+            float sig = 1.0f / (1.0f + expf(-sum));
+            qkv[i] = sum * sig;
+        }
+    }
 
     /* 2. Split QKV: Q[16×128=2048] + K[16×128=2048] + V[64×128=8192] */
     float* Q = qkv;                          /* [2048] = 16 key heads × 128 */

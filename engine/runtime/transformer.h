@@ -74,7 +74,7 @@ typedef struct {
     float* ssm_a;          /* ssm_a [32] */
     float* ssm_dt_bias;    /* ssm_dt.bias [32] */
     float* ssm_norm_w;     /* ssm_norm.weight [128] */
-    float* ssm_conv1d_w;   /* ssm_conv1d.weight [4, 8192] */
+    float* ssm_conv1d_w;   /* ssm_conv1d.weight [4, 12288] FP32 */
 
     /* Shared expert (sigmoid-gated, added to routed experts) */
     void* shexp_gate;   /* [hidden, intermediate] Q8_0 */
