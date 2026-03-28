@@ -2342,3 +2342,20 @@ Loaded the Q6_K LM head (795 MB) on CPU. Real logits now computed: max logit=12.
 Discovered missing Q8_0 type in the GGUF parser's block size tables. Embedding tensor data_size was reported as 4 GB (FP32 fallback) instead of 1.08 GB (correct Q8_0). Fix added `GGML_TYPE_Q8_0` constant but caused a GPU upload hang — reverted pending investigation. The per-token embedding reading code uses its own Q8_0 calculations and works correctly despite the parser issue.
 
 **65 experiments logged in results.tsv.**
+
+### 22.5 Critical Bug Fixes (v10.3-v10.6)
+
+Three critical bugs were identified and fixed through debugging + ML expert consultation:
+
+**Bug 1: Missing shared expert FFN (v10.3)**
+Qwen3.5-397B has an always-active shared expert alongside K routed experts. Without it, MoE output was systematically biased, causing value explosion from 0.5 at L0 to 16500 at L59.
+
+**Bug 2: Q4_K scale decode (v10.4)**
+The `decode_q4k_scales` function used the wrong bit-packing layout — treating 12 bytes as a dense 6-bit bitstream instead of GGML's structured format. Only sub-block 0's scale was correct by accident. Fixed in CPU (q4k_dequant.h) and all GPU kernels.
+
+**Bug 3: Missing sigmoid gate on shared expert (v10.6)**
+The shared expert output must be gated by `sigmoid(dot(ffn_gate_inp_shexp, input))` before adding to MoE output. The `ffn_gate_inp_shexp.weight` tensor (dims=[4096,0], FP32) is a learned gating vector, NOT a dummy tensor. Without this gate, shared expert added with weight=1.0, causing h_rms explosion. With sigmoid gating: h_rms at L15 dropped from 362 to 14.8 (24x reduction).
+
+**Reference validation**: llama.cpp (b8565) confirmed working — produces coherent output `[Start thinking] Thinking Process: 1. **Analyze` at 0.2 tok/s CPU-only. Our engine produces varied but incoherent tokens (`carga Salir compuls lin performed`), indicating remaining computation errors likely in the DeltaNet linear attention recurrence.
+
+**68 experiments logged in results.tsv.**
