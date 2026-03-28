@@ -184,9 +184,11 @@ static void deltanet_forward(
     float beta[DN_NUM_GATES];
 
     for (h = 0; h < DN_NUM_GATES; h++) {
-        /* Decay: g = exp(-exp(A_log) * softplus(alpha + dt_bias)) */
+        /* Decay: g = exp(A_log * softplus(alpha + dt_bias))
+         * A_log is stored directly in GGUF (negative value → decay < 1)
+         * llama.cpp: gate = exp(ssm_a * softplus(alpha + dt_bias)) */
         float a = (a_log && dt_bias) ?
-            expf(-expf(a_log[h]) * (logf(1.0f + expf(alpha_raw[h] + dt_bias[h])))) :
+            expf(a_log[h] * (logf(1.0f + expf(alpha_raw[h] + dt_bias[h])))) :
             0.99f;
         /* Clamp to (0, 1] */
         if (a > 1.0f) a = 1.0f;

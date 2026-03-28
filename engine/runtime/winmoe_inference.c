@@ -873,7 +873,7 @@ int main(int argc, char** argv) {
                     int hi;
                     for (hi = 0; hi < DN_NUM_GATES; hi++) {
                         float a_val = (lw->ssm_a && lw->ssm_dt_bias) ?
-                            expf(-expf(lw->ssm_a[hi]) * (logf(1.0f + expf(alpha_raw[hi] + lw->ssm_dt_bias[hi])))) : 0.99f;
+                            expf(lw->ssm_a[hi] * (logf(1.0f + expf(alpha_raw[hi] + lw->ssm_dt_bias[hi])))) : 0.99f;
                         if (a_val > 1.0f) a_val = 1.0f;
                         if (a_val < 0.0f) a_val = 0.0f;
                         if (_isnan(a_val)) a_val = 0.99f;
