@@ -16,15 +16,21 @@
 #include <string.h>
 #include <stdlib.h>
 
-/* DeltaNet config for Qwen3.5 */
-#define DN_NUM_Q_HEADS 32
-#define DN_NUM_KV_GROUPS 16
-#define DN_HEADS_PER_GROUP 2  /* 32 / 16 */
-#define DN_HEAD_DIM 128       /* state_size */
-#define DN_INNER 4096         /* 32 * 128 */
-#define DN_QKV_DIM 8192       /* Q(4096) + K(2048) + V(2048) */
-#define DN_GATE_DIM 4096      /* Z gate */
-#define DN_NUM_GATES 32       /* alpha, beta per head */
+/* DeltaNet config for Qwen3.5-397B:
+ * QKV tensor [4096, 12288] = Q(2048) + K(2048) + V(8192)
+ * 64 value heads × 128 value_dim, 16 key heads × 128 key_dim
+ * State: 64 per-value-head matrices of [128 × 128]
+ * Each KV group: 4 value heads share 1 key head (64/16=4)
+ */
+#define DN_NUM_Q_HEADS 64      /* num_value_heads — output & state heads */
+#define DN_NUM_KV_GROUPS 16    /* num_key_heads — K groups */
+#define DN_HEADS_PER_GROUP 4   /* 64 / 16 */
+#define DN_HEAD_DIM 128        /* both key_head_dim and value_head_dim */
+#define DN_INNER 8192          /* 64 * 128 — value/output dimension */
+#define DN_KEY_DIM 2048        /* 16 * 128 — key/query dimension */
+#define DN_QKV_DIM 12288       /* Q(2048) + K(2048) + V(8192) */
+#define DN_GATE_DIM 8192       /* Z gate — same as inner */
+#define DN_NUM_GATES 64        /* alpha, beta: one per value head */
 #define DN_CONV_WIDTH 4
 
 /* Per-layer DeltaNet state */
@@ -143,10 +149,10 @@ static void deltanet_forward(
     if (w_beta) quant_matvec(beta_raw, w_beta, x, DN_NUM_GATES, hidden_dim, w_beta_type);
     else memset(beta_raw, 0, DN_NUM_GATES * sizeof(float));
 
-    /* 2. Split QKV: Q[32×128] + K[16×128] + V[16×128] */
-    float* Q = qkv;                          /* [4096] = 32 heads × 128 */
-    float* K = qkv + DN_INNER;               /* [2048] = 16 groups × 128 */
-    float* V = qkv + DN_INNER + DN_NUM_KV_GROUPS * DN_HEAD_DIM; /* [2048] */
+    /* 2. Split QKV: Q[16×128=2048] + K[16×128=2048] + V[64×128=8192] */
+    float* Q = qkv;                          /* [2048] = 16 key heads × 128 */
+    float* K = qkv + DN_KEY_DIM;             /* [2048] = 16 key heads × 128 */
+    float* V = qkv + DN_KEY_DIM + DN_KEY_DIM; /* [8192] = 64 value heads × 128 */
 
     /* 3. Compute gate parameters per head */
     float gate_decay[DN_NUM_GATES];
@@ -167,16 +173,14 @@ static void deltanet_forward(
         beta[h] = 1.0f / (1.0f + expf(-beta_raw[h])); /* sigmoid */
     }
 
-    /* 4. L2 normalize Q per head and K per group */
-    for (h = 0; h < DN_NUM_Q_HEADS; h++) {
-        dn_l2norm(Q + h * DN_HEAD_DIM, DN_HEAD_DIM);
-    }
+    /* 4. L2 normalize Q per key-head and K per key-head */
     for (g = 0; g < DN_NUM_KV_GROUPS; g++) {
+        dn_l2norm(Q + g * DN_HEAD_DIM, DN_HEAD_DIM);
         dn_l2norm(K + g * DN_HEAD_DIM, DN_HEAD_DIM);
     }
 
-    /* 5. Per-head recurrence (32 heads, each with own state + decay) */
-    /* K/V are broadcast from 16 groups (2 Q-heads per group share K/V) */
+    /* 5. Per-value-head recurrence (64 heads, each with own state + decay) */
+    /* Q/K are broadcast from 16 key groups (4 value-heads per key group) */
     float* head_output = state->tmp_head_out;
     memset(head_output, 0, DN_INNER * sizeof(float));
     float scale = 1.0f / sqrtf((float)DN_HEAD_DIM);
@@ -186,10 +190,10 @@ static void deltanet_forward(
        The recurrence itself is fast enough (~30ms) that parallelizing heads
        within it gives diminishing returns vs the matvec cost (~400ms). */
     for (h = 0; h < DN_NUM_Q_HEADS; h++) {
-        g = h / DN_HEADS_PER_GROUP;  /* KV group index */
-        float* S = state->S + h * DN_HEAD_DIM * DN_HEAD_DIM; /* per-head state [128,128] */
-        float* k = K + g * DN_HEAD_DIM;   /* shared K from group */
-        float* v = V + g * DN_HEAD_DIM;   /* shared V from group */
+        g = h / DN_HEADS_PER_GROUP;  /* KV group index (16 key groups) */
+        float* S = state->S + h * DN_HEAD_DIM * DN_HEAD_DIM; /* per-value-head state [128,128] */
+        float* k = K + g * DN_HEAD_DIM;   /* shared K from key group */
+        float* v = V + h * DN_HEAD_DIM;   /* per-value-head V */
         float g_decay = gate_decay[h];     /* per-head gate */
         float b = beta[h];                 /* per-head beta */
 
@@ -237,7 +241,7 @@ static void deltanet_forward(
         }
 
         /* Pass 2: Output read — o = S^T @ q (row-broadcast FMA pattern) */
-        float* q_head = Q + h * DN_HEAD_DIM;
+        float* q_head = Q + g * DN_HEAD_DIM; /* Q is per key group, not per value head */
         float* o = head_output + h * DN_HEAD_DIM;
         __m256 out_acc[16];
         for (d = 0; d < 16; d++) out_acc[d] = _mm256_setzero_ps();

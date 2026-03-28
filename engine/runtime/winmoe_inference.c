@@ -445,6 +445,8 @@ int main(int argc, char** argv) {
            cfg.hidden_dim, cfg.intermediate, cfg.num_layers);
     printf("Attention: Q=%d heads, KV=%d heads, head_dim=%d\n",
            cfg.num_q_heads, cfg.num_kv_heads, cfg.head_dim);
+    printf("SSM: inner=%d state=%d head_count=%d\n",
+           model.ssm_inner_size, model.ssm_state_size, model.head_count);
     printf("MoE: %d experts, K=%d active\n", cfg.num_experts, cfg.expert_k);
     printf("Tokens to generate: %d\n\n", num_tokens);
 
@@ -595,16 +597,21 @@ int main(int argc, char** argv) {
                 if (i % 10 == 0) { fprintf(stderr, "  Loading layer %d/%d...\n", i, cfg.num_layers); fflush(stderr); }
             }
             if (layers[i].is_deltanet && layers[i].w_qkv) {
-                fprintf(stderr, "  GPU upload L%d: qkv=%p gate=%p ssm=%p\n", i,
-                    layers[i].w_qkv, layers[i].w_attn_gate, layers[i].w_ssm_out);
-                fflush(stderr);
-                /* Upload Q8_0 weights → GPU FP16 */
-                int inner = 4096; /* ssm.inner_size — TODO: read from config */
-                if (model.ssm_inner_size > 0) inner = model.ssm_inner_size;
+                if (i == 0) {
+                    char tn[256]; snprintf(tn, 256, "blk.0.attn_qkv.weight");
+                    TensorInfo* tqkv = find_tensor(&model, tn);
+                    if (tqkv) fprintf(stderr, "  DeltaNet QKV dims=[%llu,%llu] type=%d\n",
+                        (unsigned long long)tqkv->dims[0], (unsigned long long)tqkv->dims[1], tqkv->type);
+                }
+                /* Upload Q8_0 weights → GPU
+                 * QKV: [hidden, 12288] = Q(2048) + K(2048) + V(8192)
+                 * Gate: [hidden, 8192] = Z gate
+                 * SSM Out: [8192, hidden] = output projection
+                 */
                 gpu_upload_deltanet_weights(i,
-                    layers[i].w_qkv, H, inner * 2,       /* QKV: [hidden, inner*2] */
-                    layers[i].w_attn_gate, H, inner,      /* Gate: [hidden, inner] */
-                    layers[i].w_ssm_out, inner, H);       /* SSM Out: [inner, hidden] */
+                    layers[i].w_qkv, H, DN_QKV_DIM,      /* QKV: [4096, 12288] */
+                    layers[i].w_attn_gate, H, DN_INNER,   /* Gate: [4096, 8192] */
+                    layers[i].w_ssm_out, DN_INNER, H);    /* SSM Out: [8192, 4096] */
             }
         }
         fprintf(stderr, "GPU VRAM used: %.0f MB (DeltaNet)\n", gpu_vram_used_mb());
@@ -796,11 +803,10 @@ int main(int argc, char** argv) {
 
                 if (use_gpu && lw->w_qkv) {
                     /* === GPU DELTANET (Phase 3: async pipeline) === */
-                    int inner = (model.ssm_inner_size > 0) ? model.ssm_inner_size : 4096;
                     int slot_idx = layer % 2;
 
                     /* ASYNC: Launch QKV+Gate on GPU (returns immediately) */
-                    gpu_launch_qkv_gate(layer, slot_idx, normed, H, inner * 2, inner);
+                    gpu_launch_qkv_gate(layer, slot_idx, normed, H, DN_QKV_DIM, DN_INNER);
 
                     /* CPU: Alpha + Beta projections WHILE GPU computes (overlap!) */
                     float* alpha_raw = dn_states[layer].tmp_alpha;
@@ -814,9 +820,10 @@ int main(int argc, char** argv) {
                     float* gpu_gate = gpu_get_gate_out(slot_idx);
 
                     /* CPU: DeltaNet state recurrence using GPU's QKV output */
+                    /* QKV split: Q[2048] + K[2048] + V[8192] = 12288 */
                     float* Q = gpu_qkv;
-                    float* K_ptr = gpu_qkv + DN_INNER;
-                    float* V_ptr = gpu_qkv + DN_INNER + DN_NUM_KV_GROUPS * DN_HEAD_DIM;
+                    float* K_ptr = gpu_qkv + DN_KEY_DIM;
+                    float* V_ptr = gpu_qkv + DN_KEY_DIM + DN_KEY_DIM;
 
                     /* Compute gate parameters */
                     float gate_decay[DN_NUM_GATES];
@@ -832,8 +839,8 @@ int main(int argc, char** argv) {
                         beta_vals[hi] = 1.0f / (1.0f + expf(-beta_raw[hi]));
                     }
 
-                    /* L2 normalize Q and K */
-                    for (hi = 0; hi < DN_NUM_Q_HEADS; hi++) dn_l2norm(Q + hi * DN_HEAD_DIM, DN_HEAD_DIM);
+                    /* L2 normalize Q (16 key heads) and K (16 key heads) */
+                    for (hi = 0; hi < DN_NUM_KV_GROUPS; hi++) dn_l2norm(Q + hi * DN_HEAD_DIM, DN_HEAD_DIM);
                     for (hi = 0; hi < DN_NUM_KV_GROUPS; hi++) dn_l2norm(K_ptr + hi * DN_HEAD_DIM, DN_HEAD_DIM);
 
                     /* State recurrence (AVX2 vectorized) */
@@ -845,8 +852,8 @@ int main(int argc, char** argv) {
                     for (h_idx = 0; h_idx < DN_NUM_Q_HEADS; h_idx++) {
                         g_idx = h_idx / DN_HEADS_PER_GROUP;
                         float* S = dn_states[layer].S + h_idx * DN_HEAD_DIM * DN_HEAD_DIM;
-                        float* k = K_ptr + g_idx * DN_HEAD_DIM;
-                        float* v = V_ptr + g_idx * DN_HEAD_DIM;
+                        float* k = K_ptr + g_idx * DN_HEAD_DIM;  /* shared K from key group */
+                        float* v = V_ptr + h_idx * DN_HEAD_DIM;  /* per-value-head V */
 
                         __m256 vdecay = _mm256_set1_ps(gate_decay[h_idx]);
                         __m256 ret_acc[16];
@@ -883,7 +890,7 @@ int main(int argc, char** argv) {
                             }
                         }
 
-                        float* q_head = Q + h_idx * DN_HEAD_DIM;
+                        float* q_head = Q + g_idx * DN_HEAD_DIM; /* Q is per key group */
                         float* o = head_output + h_idx * DN_HEAD_DIM;
                         __m256 out_acc[16];
                         for (d_idx = 0; d_idx < 16; d_idx++) out_acc[d_idx] = _mm256_setzero_ps();
