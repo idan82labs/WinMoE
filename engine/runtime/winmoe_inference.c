@@ -427,7 +427,7 @@ int main(int argc, char** argv) {
     cfg.intermediate = model.expert_intermediate;
     cfg.num_layers = model.num_layers;
     cfg.num_experts = model.num_experts;
-    cfg.expert_k = 4; /* Override: Qwen3.5-397B design point is K=4 for speed/quality balance */
+    cfg.expert_k = 4; /* Using K=4 for speed; model designed for K=10 */
     cfg.rope_theta = model.rope_theta > 0 ? model.rope_theta : 10000000.0f;
     cfg.max_seq_len = MAX_SEQ;
     cfg.num_kv_heads = model.head_count_kv > 0 ? model.head_count_kv : 2;
@@ -659,9 +659,9 @@ int main(int argc, char** argv) {
     LARGE_INTEGER prof_t0, prof_t1;
 
     /* Start with token ID 9707 ("Hello") — hardcoded for now */
-    /* Hardcoded prompt: <|im_start|>user\nHello!<|im_end|>\n<|im_start|>assistant\n */
-    int prompt_tokens[] = {151644, 872, 198, 9707, 0, 151645, 198, 151644, 77091, 198};
-    int prompt_len = 10;
+    /* Hardcoded prompt: <|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n */
+    int prompt_tokens[] = {151644, 872, 198, 9707, 151645, 198, 151644, 77091, 198};
+    int prompt_len = 9;
     int cur_token = prompt_tokens[0];
     int tokens_generated = 0;
 
@@ -904,7 +904,7 @@ int main(int argc, char** argv) {
                         H
                     );
                 }
-            } else if (lw->wq && lw->wk && lw->wv && lw->wo) {
+            } else if (0 && lw->wq && lw->wk && lw->wv && lw->wo) { /* DEBUG: GQA disabled to isolate */
                 /* === STANDARD GQA ATTENTION (Qwen3.5: gated + QK norm + partial RoPE) === */
                 /* Standard attention: Q=[4096,16384], so 32 heads × 256 dim × 2 (gate) */
                 int nqh = 32;
@@ -987,6 +987,24 @@ int main(int argc, char** argv) {
                     /* 6. GQA attention */
                     gqa_attention(attn_buf, q_std, &kv_caches[layer], nqh, nkvh, hd);
 
+                    /* DEBUG: GQA intermediate magnitudes */
+                    if (tok == 0 && layer == 3) {
+                        float arms = 0; for (i = 0; i < attn_dim; i++) arms += attn_buf[i]*attn_buf[i];
+                        arms = sqrtf(arms / attn_dim);
+                        float grms = 0; for (i = 0; i < attn_dim; i++) grms += gate_buf_std[i]*gate_buf_std[i];
+                        grms = sqrtf(grms / attn_dim);
+                        float krms = 0; for (i = 0; i < kv_out_dim; i++) krms += k_buf[i]*k_buf[i];
+                        krms = sqrtf(krms / kv_out_dim);
+                        float vrms = 0; for (i = 0; i < kv_out_dim; i++) vrms += v_buf[i]*v_buf[i];
+                        vrms = sqrtf(vrms / kv_out_dim);
+                        float nrms = 0; for (i = 0; i < H; i++) nrms += normed[i]*normed[i];
+                        nrms = sqrtf(nrms / H);
+                        fprintf(stderr, "  GQA L3: input_rms=%.4f k_rms=%.4f v_rms=%.4f q+gate_rms=%.4f gate_rms=%.4f attn_pre_gate=%.4f\n",
+                            nrms, krms, vrms, sqrtf(arms), grms, arms);
+                        fprintf(stderr, "  GQA L3: dims: q_out=%d kv_out=%d attn=%d hd=%d nqh=%d nkvh=%d\n",
+                            q_out_dim, kv_out_dim, attn_dim, hd, nqh, nkvh);
+                    }
+
                     /* 7. Sigmoid output gating: attn_out *= sigmoid(gate) */
                     for (i = 0; i < attn_dim; i++) {
                         float g = gate_buf_std[i];
@@ -994,9 +1012,21 @@ int main(int argc, char** argv) {
                         attn_buf[i] *= sig;
                     }
 
+                    if (tok == 0 && layer == 3) {
+                        float arms2 = 0; for (i = 0; i < attn_dim; i++) arms2 += attn_buf[i]*attn_buf[i];
+                        arms2 = sqrtf(arms2 / attn_dim);
+                        fprintf(stderr, "  GQA L3: attn_post_gate=%.4f\n", arms2);
+                    }
+
                     /* 8. O projection: [attn_dim → hidden_dim] — GPU if available */
                     if (use_gpu && gpu_gqa_output(layer, attn_buf, attn_dim, o_out, H) != 0)
                         quant_matvec(o_out, lw->wo, attn_buf, H, attn_dim, lw->wo_type);
+
+                    if (tok == 0 && layer == 3) {
+                        float orms = 0; for (i = 0; i < H; i++) orms += o_out[i]*o_out[i];
+                        orms = sqrtf(orms / H);
+                        fprintf(stderr, "  GQA L3: o_out_rms=%.4f\n", orms);
+                    }
                 }
 
                 if (q_gate_buf) _freea(q_gate_buf);
@@ -1263,6 +1293,20 @@ int main(int argc, char** argv) {
                 quant_matvec(expert_out, lw->shexp_down, act_buf, H, I, lw->shexp_down_type);
 
                 /* Add shared expert output to moe_out (weight=1, always active) */
+                /* DEBUG: shared expert magnitude */
+                if (tok == 0 && layer <= 5) {
+                    float srms = 0; for (i = 0; i < H; i++) srms += expert_out[i]*expert_out[i];
+                    srms = sqrtf(srms / H);
+                    float grms2 = 0; for (i = 0; i < I; i++) grms2 += gate_buf[i]*gate_buf[i];
+                    grms2 = sqrtf(grms2 / I);
+                    float urms = 0; for (i = 0; i < I; i++) urms += up_buf[i]*up_buf[i];
+                    urms = sqrtf(urms / I);
+                    float arms2 = 0; for (i = 0; i < I; i++) arms2 += act_buf[i]*act_buf[i];
+                    arms2 = sqrtf(arms2 / I);
+                    fprintf(stderr, "  SHEXP L%d: gate=%.4f up=%.4f act=%.4f out=%.4f type=%d\n",
+                        layer, grms2, urms, arms2, srms, lw->shexp_gate_type);
+                }
+
                 for (i = 0; i + 7 < H; i += 8) {
                     __m256 vm = _mm256_loadu_ps(moe_out + i);
                     __m256 ve = _mm256_loadu_ps(expert_out + i);
