@@ -46,6 +46,8 @@ typedef struct {
     /* Norms (FP32) */
     float* attn_norm;  /* [hidden] */
     float* ffn_norm;   /* [hidden] */
+    float* q_norm;     /* [head_dim] — Qwen3.5 per-head QK RMSNorm */
+    float* k_norm;     /* [head_dim] */
 
     /* Router (FP32 or FP16) */
     void* gate_inp;    /* [hidden, num_experts] */
@@ -73,6 +75,12 @@ typedef struct {
     float* ssm_dt_bias;    /* ssm_dt.bias [32] */
     float* ssm_norm_w;     /* ssm_norm.weight [128] */
     float* ssm_conv1d_w;   /* ssm_conv1d.weight [4, 8192] */
+
+    /* Shared expert (always active alongside routed experts) */
+    void* shexp_gate;   /* [hidden, intermediate] Q8_0 */
+    void* shexp_up;     /* [hidden, intermediate] Q8_0 */
+    void* shexp_down;   /* [intermediate, hidden] Q8_0 */
+    int shexp_gate_type, shexp_up_type, shexp_down_type;
 
     /* Expert tensor info for loading */
     uint64_t gate_exps_offset;  /* offset in GGUF shard */

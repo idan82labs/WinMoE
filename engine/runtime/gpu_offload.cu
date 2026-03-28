@@ -30,6 +30,7 @@
 
 /* Per-layer GPU weight pointers (Q8_0 on device) */
 typedef struct {
+    /* DeltaNet weights */
     void* d_qkv;
     void* d_gate;
     void* d_ssm_out;
@@ -37,6 +38,16 @@ typedef struct {
     int gate_rows, gate_cols;
     int ssm_rows, ssm_cols;
     int loaded;
+    /* Standard GQA weights (Q8_0) */
+    void* d_wq;     /* [hidden, nqh*hd*2] — doubled for gate */
+    void* d_wk;     /* [hidden, nkvh*hd] */
+    void* d_wv;     /* [hidden, nkvh*hd] */
+    void* d_wo;     /* [nqh*hd, hidden] */
+    int wq_rows, wq_cols;
+    int wk_rows, wk_cols;
+    int wv_rows, wv_cols;
+    int wo_rows, wo_cols;
+    int gqa_loaded;
 } LayerGPU;
 
 /* Double-buffered pipeline slot */
@@ -74,6 +85,17 @@ static float g_vram_used = 0;
 static int g_hidden_dim = 4096;
 static int g_qkv_dim = 8192;
 static int g_gate_dim = 4096;
+
+/* GGML Q4_K/Q5_K scale decode helper (matches get_scale_min_k4) */
+__device__ __forceinline__ void gpu_get_scale_min(int sub, const unsigned char* sc, int* scale, int* mn) {
+    if (sub < 4) {
+        *scale = sc[sub] & 63;
+        *mn = sc[sub + 4] & 63;
+    } else {
+        *scale = (sc[sub + 4] & 0xF) | ((sc[sub - 4] >> 6) << 4);
+        *mn = (sc[sub + 4] >> 4) | ((sc[sub] >> 6) << 4);
+    }
+}
 
 /* Q8_0 matvec kernel — shared memory input caching + vectorized loads */
 __global__ void q8_matvec_kernel(float* output, const unsigned char* weights,
@@ -159,9 +181,8 @@ __global__ void q4k_matvec_kernel(float* output, const unsigned char* weights,
 
         float block_sum = 0.0f;
         for (int sub = 0; sub < 8; sub++) {
-            /* Simple scale decode (approximate — full decode is complex) */
-            int scale_val = sc[sub < 4 ? sub : sub + 2] & 0x3F;
-            int min_val = sc[sub < 4 ? sub + 4 : sub + 6] & 0x3F;
+            int scale_val, min_val;
+            gpu_get_scale_min(sub, sc, &scale_val, &min_val);
             float sc_f = d * (float)scale_val;
             float mn_f = dmin * (float)min_val;
 
@@ -220,8 +241,8 @@ __global__ void q5k_matvec_kernel(float* output, const unsigned char* weights,
 
         float block_sum = 0.0f;
         for (int sub = 0; sub < 8; sub++) {
-            int scale_val = sc[sub < 4 ? sub : sub + 2] & 0x3F;
-            int min_val = sc[sub < 4 ? sub + 4 : sub + 6] & 0x3F;
+            int scale_val, min_val;
+            gpu_get_scale_min(sub, sc, &scale_val, &min_val);
             float sc_f = d * (float)scale_val;
             float mn_f = dmin * (float)min_val;
 
@@ -293,8 +314,8 @@ __global__ void q4k_expert_kernel(float* output, const unsigned char* weights,
         const unsigned char* sc = blk + 4;
         const unsigned char* qs = blk + 16;
 
-        int scale_val = sc[sub < 4 ? sub : sub + 2] & 0x3F;
-        int min_val = sc[sub < 4 ? sub + 4 : sub + 6] & 0x3F;
+        int scale_val, min_val;
+        gpu_get_scale_min(sub, sc, &scale_val, &min_val);
         float sc_f = d * (float)scale_val;
         float mn_f = dmin * (float)min_val;
 
@@ -349,8 +370,8 @@ __global__ void q5k_expert_kernel(float* output, const unsigned char* weights,
         const unsigned char* qh = blk + 16;
         const unsigned char* qs = blk + 48;
 
-        int scale_val = sc[sub < 4 ? sub : sub + 2] & 0x3F;
-        int min_val = sc[sub < 4 ? sub + 4 : sub + 6] & 0x3F;
+        int scale_val, min_val;
+        gpu_get_scale_min(sub, sc, &scale_val, &min_val);
         float sc_f = d * (float)scale_val;
         float mn_f = dmin * (float)min_val;
 
@@ -629,6 +650,90 @@ extern "C" int gpu_expert_batch_finish(float* moe_out, int hidden_dim) {
 }
 
 extern "C" int gpu_expert_cache_count(void) { return g_gpu_expert_count; }
+
+/* === GPU Standard Attention (GQA) === */
+
+extern "C" int gpu_upload_gqa_weights(int layer,
+    const void* wq_q8, int wq_rows, int wq_cols,
+    const void* wk_q8, int wk_rows, int wk_cols,
+    const void* wv_q8, int wv_rows, int wv_cols,
+    const void* wo_q8, int wo_rows, int wo_cols)
+{
+    if (layer >= MAX_LAYERS) return -1;
+    LayerGPU* lg = &g_layers[layer];
+
+    /* Q8_0: (rows * cols / 32) * 34 bytes */
+    int wq_size = (wq_rows * wq_cols / 32) * 34;
+    int wk_size = (wk_rows * wk_cols / 32) * 34;
+    int wv_size = (wv_rows * wv_cols / 32) * 34;
+    int wo_size = (wo_rows * wo_cols / 32) * 34;
+
+    CHECK_CUDA(cudaMalloc(&lg->d_wq, wq_size));
+    CHECK_CUDA(cudaMemcpy(lg->d_wq, wq_q8, wq_size, cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMalloc(&lg->d_wk, wk_size));
+    CHECK_CUDA(cudaMemcpy(lg->d_wk, wk_q8, wk_size, cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMalloc(&lg->d_wv, wv_size));
+    CHECK_CUDA(cudaMemcpy(lg->d_wv, wv_q8, wv_size, cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMalloc(&lg->d_wo, wo_size));
+    CHECK_CUDA(cudaMemcpy(lg->d_wo, wo_q8, wo_size, cudaMemcpyHostToDevice));
+
+    lg->wq_rows = wq_rows; lg->wq_cols = wq_cols;
+    lg->wk_rows = wk_rows; lg->wk_cols = wk_cols;
+    lg->wv_rows = wv_rows; lg->wv_cols = wv_cols;
+    lg->wo_rows = wo_rows; lg->wo_cols = wo_cols;
+    lg->gqa_loaded = 1;
+
+    g_vram_used += (wq_size + wk_size + wv_size + wo_size) / (1024.0f * 1024.0f);
+    return 0;
+}
+
+/* GPU GQA projections: Q+gate, K, V all on GPU, download results */
+extern "C" int gpu_gqa_projections(int layer,
+    const float* normed, int hidden_dim,
+    float* q_gate_out, int q_gate_dim,
+    float* k_out, int k_dim,
+    float* v_out, int v_dim)
+{
+    LayerGPU* lg = &g_layers[layer];
+    if (!lg->gqa_loaded) return -1;
+    ensure_io_buffers(q_gate_dim > hidden_dim ? q_gate_dim : hidden_dim);
+
+    /* Upload normed input */
+    CHECK_CUDA(cudaMemcpy(d_input_fp32, normed, hidden_dim * sizeof(float), cudaMemcpyHostToDevice));
+
+    /* Q+Gate projection: [hidden → q_gate_dim] */
+    q8_matvec_kernel<<<q_gate_dim, MATVEC_THREADS, hidden_dim * sizeof(float), g_stream_compute>>>(
+        d_output_fp32, (const unsigned char*)lg->d_wq, d_input_fp32, hidden_dim, q_gate_dim);
+    CHECK_CUDA(cudaMemcpy(q_gate_out, d_output_fp32, q_gate_dim * sizeof(float), cudaMemcpyDeviceToHost));
+
+    /* K projection: [hidden → k_dim] */
+    q8_matvec_kernel<<<k_dim, MATVEC_THREADS, hidden_dim * sizeof(float), g_stream_compute>>>(
+        d_output_fp32, (const unsigned char*)lg->d_wk, d_input_fp32, hidden_dim, k_dim);
+    CHECK_CUDA(cudaMemcpy(k_out, d_output_fp32, k_dim * sizeof(float), cudaMemcpyDeviceToHost));
+
+    /* V projection: [hidden → v_dim] */
+    q8_matvec_kernel<<<v_dim, MATVEC_THREADS, hidden_dim * sizeof(float), g_stream_compute>>>(
+        d_output_fp32, (const unsigned char*)lg->d_wv, d_input_fp32, hidden_dim, v_dim);
+    CHECK_CUDA(cudaMemcpy(v_out, d_output_fp32, v_dim * sizeof(float), cudaMemcpyDeviceToHost));
+
+    return 0;
+}
+
+/* GPU O projection: [attn_dim → hidden_dim] */
+extern "C" int gpu_gqa_output(int layer,
+    const float* attn_out, int attn_dim,
+    float* output, int hidden_dim)
+{
+    LayerGPU* lg = &g_layers[layer];
+    if (!lg->gqa_loaded) return -1;
+    ensure_io_buffers(attn_dim > hidden_dim ? attn_dim : hidden_dim);
+
+    CHECK_CUDA(cudaMemcpy(d_input_fp32, attn_out, attn_dim * sizeof(float), cudaMemcpyHostToDevice));
+    q8_matvec_kernel<<<hidden_dim, MATVEC_THREADS, attn_dim * sizeof(float), g_stream_compute>>>(
+        d_output_fp32, (const unsigned char*)lg->d_wo, d_input_fp32, attn_dim, hidden_dim);
+    CHECK_CUDA(cudaMemcpy(output, d_output_fp32, hidden_dim * sizeof(float), cudaMemcpyDeviceToHost));
+    return 0;
+}
 
 /* === GPU Router === */
 static float* d_router_weights[MAX_LAYERS] = {0};

@@ -21,6 +21,7 @@
 #define GGML_TYPE_F32    0
 #define GGML_TYPE_F16    1
 #define GGML_TYPE_Q4_0   2
+#define GGML_TYPE_Q8_0   8
 #define GGML_TYPE_Q4_K  12
 #define GGML_TYPE_Q5_K  13
 #define GGML_TYPE_Q6_K  14
@@ -33,6 +34,7 @@ static int ggml_block_size(int type) {
         case GGML_TYPE_F32:    return 4;    /* 1 weight per 4 bytes */
         case GGML_TYPE_F16:    return 2;
         case GGML_TYPE_Q4_0:   return 18;   /* 32 weights per block */
+        /* Q8_0 intentionally NOT here — data_size stays FP32 to avoid read issues */
         case GGML_TYPE_Q4_K:   return 144;  /* 256 weights per block */
         case GGML_TYPE_Q5_K:   return 176;
         case GGML_TYPE_Q6_K:   return 210;

@@ -295,11 +295,38 @@ static int load_shared_weights(const char* gguf_path, GGUFModel* model,
                 t = find_tensor(model, name);
                 if (t) { layers[l].wo = load_tensor_data(model, t, &size); layers[l].wo_type = t->type; }
             } else {
-                /* Store types for lazy loading — attention is skipped for 397B v0 */
+                /* Lazy load for 397B — load Q/K/V/O + detect head_dim */
                 snprintf(name, 256, "blk.%d.attn_q.weight", l);
                 t = find_tensor(model, name);
-                if (t) { layers[l].wq_type = t->type; }
+                if (t) {
+                    layers[l].wq = load_tensor_data(model, t, &size);
+                    layers[l].wq_type = t->type;
+                    if (l == 3) /* first standard layer */
+                        fprintf(stderr, "Std attn L%d: Q dims=[%llu,%llu] type=%d size=%llu\n",
+                            l, t->dims[0], t->dims[1], t->type, t->data_size);
+                }
+
+                snprintf(name, 256, "blk.%d.attn_k.weight", l);
+                t = find_tensor(model, name);
+                if (t) { layers[l].wk = load_tensor_data(model, t, &size); layers[l].wk_type = t->type; }
+
+                snprintf(name, 256, "blk.%d.attn_v.weight", l);
+                t = find_tensor(model, name);
+                if (t) { layers[l].wv = load_tensor_data(model, t, &size); layers[l].wv_type = t->type; }
+
+                snprintf(name, 256, "blk.%d.attn_output.weight", l);
+                t = find_tensor(model, name);
+                if (t) { layers[l].wo = load_tensor_data(model, t, &size); layers[l].wo_type = t->type; }
             }
+
+            /* QK RMSNorm weights (Qwen3.5 specific) */
+            snprintf(name, 256, "blk.%d.attn_q_norm.weight", l);
+            t = find_tensor(model, name);
+            if (t) { layers[l].q_norm = (float*)load_tensor_data(model, t, &size); }
+
+            snprintf(name, 256, "blk.%d.attn_k_norm.weight", l);
+            t = find_tensor(model, name);
+            if (t) { layers[l].k_norm = (float*)load_tensor_data(model, t, &size); }
         }
 
         /* Post-attention norm (both layer types) */
@@ -345,9 +372,23 @@ static int load_shared_weights(const char* gguf_path, GGUFModel* model,
             layers[l].down_exps_shard = t->shard;
         }
 
+        /* Shared expert weights (always active alongside routed experts) */
+        snprintf(name, 256, "blk.%d.ffn_gate_shexp.weight", l);
+        t = find_tensor(model, name);
+        if (t) { layers[l].shexp_gate = load_tensor_data(model, t, &size); layers[l].shexp_gate_type = t->type; }
+
+        snprintf(name, 256, "blk.%d.ffn_up_shexp.weight", l);
+        t = find_tensor(model, name);
+        if (t) { layers[l].shexp_up = load_tensor_data(model, t, &size); layers[l].shexp_up_type = t->type; }
+
+        snprintf(name, 256, "blk.%d.ffn_down_shexp.weight", l);
+        t = find_tensor(model, name);
+        if (t) { layers[l].shexp_down = load_tensor_data(model, t, &size); layers[l].shexp_down_type = t->type; }
+
         if (l % 10 == 0) { fprintf(stderr, "  Layer %d/%d loaded\n", l, model->num_layers); fflush(stderr); }
     }
 
+    if (layers[0].shexp_gate) fprintf(stderr, "Shared expert loaded for all layers\n");
     printf("Shared weights loaded.\n\n");
     return 0;
 }
@@ -402,6 +443,23 @@ int main(int argc, char** argv) {
     printf("MoE: %d experts, K=%d active\n", cfg.num_experts, cfg.expert_k);
     printf("Tokens to generate: %d\n\n", num_tokens);
 
+    /* DEBUG: scan for shared expert tensors */
+    {
+        int ti;
+        for (ti = 0; ti < (int)model.n_tensors; ti++) {
+            if (strstr(model.tensors[ti].name, "shexp") ||
+                strstr(model.tensors[ti].name, "shared") ||
+                strstr(model.tensors[ti].name, "ffn_gate_sh") ||
+                (strstr(model.tensors[ti].name, "blk.0.ffn") && !strstr(model.tensors[ti].name, "exps") && !strstr(model.tensors[ti].name, "inp"))) {
+                fprintf(stderr, "TENSOR: %s  dims=[%llu,%llu] type=%d\n",
+                    model.tensors[ti].name,
+                    (unsigned long long)model.tensors[ti].dims[0],
+                    (unsigned long long)model.tensors[ti].dims[1],
+                    model.tensors[ti].type);
+            }
+        }
+    }
+
     /* Open persistent shard handles for all reads */
     open_shard_handles(&model);
 
@@ -447,14 +505,12 @@ int main(int argc, char** argv) {
     }
     if (output_weight) {
         lm_head_type = output_weight->type;
-        if (output_weight->data_size > 100000000ULL) {
-            fprintf(stderr, "LM head too large (%llu bytes) — skipping for v0.2\n",
-                    (unsigned long long)output_weight->data_size);
-            lm_head = NULL; /* will produce random logits but won't crash */
-        } else {
-            lm_head = load_tensor_data(&model, output_weight, &sz);
-        }
-        fprintf(stderr, "LM head: type=%d, vocab=%d\n", lm_head_type, vocab_size);
+        fprintf(stderr, "Loading LM head: type=%d, vocab=%d, size=%.0f MB...\n",
+                lm_head_type, vocab_size, output_weight->data_size / (1024.0 * 1024.0));
+        fflush(stderr);
+        lm_head = load_tensor_data(&model, output_weight, &sz);
+        if (lm_head) fprintf(stderr, "LM head loaded (%d MB)\n", sz / (1024*1024));
+        else fprintf(stderr, "WARNING: LM head failed to load\n");
     }
 
     cfg.vocab_size = vocab_size;
@@ -501,7 +557,10 @@ int main(int argc, char** argv) {
         if (layers[i].is_deltanet) {
             dn_state_init(&dn_states[i]);
         } else {
-            kv_cache_init(&kv_caches[i], MAX_SEQ, cfg.num_kv_heads, cfg.head_dim);
+            /* Standard attention: head_dim=256 (from Q weight [4096,16384] → 32 heads × 256 × 2) */
+            int std_hd = 256;
+            int std_nqh = 32;
+            kv_cache_init(&kv_caches[i], MAX_SEQ, cfg.num_kv_heads, std_hd);
         }
     }
     /* === GPU INITIALIZATION === */
@@ -531,6 +590,9 @@ int main(int argc, char** argv) {
                 if (i % 10 == 0) { fprintf(stderr, "  Loading layer %d/%d...\n", i, cfg.num_layers); fflush(stderr); }
             }
             if (layers[i].is_deltanet && layers[i].w_qkv) {
+                fprintf(stderr, "  GPU upload L%d: qkv=%p gate=%p ssm=%p\n", i,
+                    layers[i].w_qkv, layers[i].w_attn_gate, layers[i].w_ssm_out);
+                fflush(stderr);
                 /* Upload Q8_0 weights → GPU FP16 */
                 int inner = 4096; /* ssm.inner_size — TODO: read from config */
                 if (model.ssm_inner_size > 0) inner = model.ssm_inner_size;
@@ -540,7 +602,29 @@ int main(int argc, char** argv) {
                     layers[i].w_ssm_out, inner, H);       /* SSM Out: [inner, hidden] */
             }
         }
-        fprintf(stderr, "GPU VRAM used: %.0f MB\n", gpu_vram_used_mb());
+        fprintf(stderr, "GPU VRAM used: %.0f MB (DeltaNet)\n", gpu_vram_used_mb());
+
+        /* Upload standard GQA weights to GPU (Q8_0, ~840 MB for 15 layers) */
+        {
+            int gqa_count = 0;
+            for (i = 0; i < cfg.num_layers; i++) {
+                if (!layers[i].is_deltanet && layers[i].wq && layers[i].wk && layers[i].wv && layers[i].wo) {
+                    /* Q: [H, nqh*hd*2], K: [H, nkvh*hd], V: [H, nkvh*hd], O: [nqh*hd, H] */
+                    int std_nqh = 32, std_hd = 256;
+                    int q_cols = std_nqh * std_hd * 2;  /* 16384 */
+                    int kv_cols = cfg.num_kv_heads * std_hd; /* 512 */
+                    int o_rows = std_nqh * std_hd;  /* 8192 */
+                    if (gpu_upload_gqa_weights(i,
+                        layers[i].wq, H, q_cols,
+                        layers[i].wk, H, kv_cols,
+                        layers[i].wv, H, kv_cols,
+                        layers[i].wo, o_rows, H) == 0)
+                        gqa_count++;
+                }
+            }
+            if (gqa_count > 0)
+                fprintf(stderr, "GPU GQA: %d layers uploaded, VRAM=%.0f MB\n", gqa_count, gpu_vram_used_mb());
+        }
         /* Router stays on CPU — 480MB VRAM better spent on expert cache (v8.7, v9.5 confirmed) */
     } else {
         fprintf(stderr, "GPU init failed — running CPU-only\n");
@@ -575,7 +659,10 @@ int main(int argc, char** argv) {
     LARGE_INTEGER prof_t0, prof_t1;
 
     /* Start with token ID 9707 ("Hello") — hardcoded for now */
-    int cur_token = 9707;
+    /* Hardcoded prompt: <|im_start|>user\nHello!<|im_end|>\n<|im_start|>assistant\n */
+    int prompt_tokens[] = {151644, 872, 198, 9707, 0, 151645, 198, 151644, 77091, 198};
+    int prompt_len = 10;
+    int cur_token = prompt_tokens[0];
     int tokens_generated = 0;
 
     QueryPerformanceCounter(&gen_start);
@@ -817,9 +904,108 @@ int main(int argc, char** argv) {
                         H
                     );
                 }
+            } else if (lw->wq && lw->wk && lw->wv && lw->wo) {
+                /* === STANDARD GQA ATTENTION (Qwen3.5: gated + QK norm + partial RoPE) === */
+                /* Standard attention: Q=[4096,16384], so 32 heads × 256 dim × 2 (gate) */
+                int nqh = 32;
+                int nkvh = cfg.num_kv_heads; /* 2 */
+                int hd = 256; /* confirmed from Q weight dims: 16384 / 32 / 2 = 256 */
+                int q_out_dim = nqh * hd * 2; /* 16384, doubled for Q+gate */
+                int kv_out_dim = nkvh * hd;   /* 512 */
+                int attn_dim = nqh * hd;      /* 8192 */
+
+                /* Allocate temp buffers */
+                float* q_gate_buf = (float*)_malloca(q_out_dim * sizeof(float));
+                float* k_buf = (float*)_malloca(kv_out_dim * sizeof(float));
+                float* v_buf = (float*)_malloca(kv_out_dim * sizeof(float));
+                float* attn_buf = (float*)_malloca(attn_dim * sizeof(float));
+                float* gate_buf_std = (float*)_malloca(attn_dim * sizeof(float));
+
+                if (q_gate_buf && k_buf && v_buf && attn_buf && gate_buf_std) {
+                    /* 1. Q+Gate, K, V projections — GPU if available, else CPU */
+                    int gpu_proj = use_gpu ? gpu_gqa_projections(layer, normed, H,
+                        q_gate_buf, q_out_dim, k_buf, kv_out_dim, v_buf, kv_out_dim) : -1;
+                    if (gpu_proj != 0) {
+                        /* CPU fallback */
+                        quant_matvec(q_gate_buf, lw->wq, normed, q_out_dim, H, lw->wq_type);
+                        quant_matvec(k_buf, lw->wk, normed, kv_out_dim, H, lw->wk_type);
+                        quant_matvec(v_buf, lw->wv, normed, kv_out_dim, H, lw->wv_type);
+                    }
+
+                    /* 2. Deinterleave Q and Gate from doubled output */
+                    /* Layout: [Q_h0(hd), Gate_h0(hd), Q_h1(hd), Gate_h1(hd), ...] */
+                    float* q_std = q;  /* reuse pre-allocated q buffer */
+                    for (int h = 0; h < nqh; h++) {
+                        memcpy(q_std + h * hd, q_gate_buf + h * hd * 2, hd * sizeof(float));
+                        memcpy(gate_buf_std + h * hd, q_gate_buf + h * hd * 2 + hd, hd * sizeof(float));
+                    }
+
+                    /* 3. QK RMSNorm (per-head, before RoPE) */
+                    if (lw->q_norm) {
+                        for (int h = 0; h < nqh; h++)
+                            rmsnorm(q_std + h * hd, q_std + h * hd, lw->q_norm, hd);
+                    }
+                    if (lw->k_norm) {
+                        for (int h = 0; h < nkvh; h++)
+                            rmsnorm(k_buf + h * hd, k_buf + h * hd, lw->k_norm, hd);
+                    }
+
+                    /* 4. Partial RoPE — only first rope_dim=64 of 256 dims, split-halves */
+                    {
+                        int rope_dim = hd / 4; /* partial_rotary_factor = 0.25 → 64 */
+                        int half = rope_dim / 2; /* 32 */
+                        float theta = cfg.rope_theta;
+                        /* Apply to Q heads */
+                        for (int h = 0; h < nqh; h++) {
+                            float* qh = q_std + h * hd;
+                            for (int j = 0; j < half; j++) {
+                                float freq = 1.0f / powf(theta, (float)(2 * j) / (float)rope_dim);
+                                float val = (float)tok * freq;
+                                float cv = cosf(val), sv = sinf(val);
+                                float r0 = qh[j], r1 = qh[j + half];
+                                qh[j]        = r0 * cv - r1 * sv;
+                                qh[j + half] = r0 * sv + r1 * cv;
+                            }
+                        }
+                        /* Apply to K heads */
+                        for (int h = 0; h < nkvh; h++) {
+                            float* kh = k_buf + h * hd;
+                            for (int j = 0; j < half; j++) {
+                                float freq = 1.0f / powf(theta, (float)(2 * j) / (float)rope_dim);
+                                float val = (float)tok * freq;
+                                float cv = cosf(val), sv = sinf(val);
+                                float r0 = kh[j], r1 = kh[j + half];
+                                kh[j]        = r0 * cv - r1 * sv;
+                                kh[j + half] = r0 * sv + r1 * cv;
+                            }
+                        }
+                    }
+
+                    /* 5. KV cache append */
+                    kv_cache_append(&kv_caches[layer], k_buf, v_buf);
+
+                    /* 6. GQA attention */
+                    gqa_attention(attn_buf, q_std, &kv_caches[layer], nqh, nkvh, hd);
+
+                    /* 7. Sigmoid output gating: attn_out *= sigmoid(gate) */
+                    for (i = 0; i < attn_dim; i++) {
+                        float g = gate_buf_std[i];
+                        float sig = 1.0f / (1.0f + expf(-g));
+                        attn_buf[i] *= sig;
+                    }
+
+                    /* 8. O projection: [attn_dim → hidden_dim] — GPU if available */
+                    if (use_gpu && gpu_gqa_output(layer, attn_buf, attn_dim, o_out, H) != 0)
+                        quant_matvec(o_out, lw->wo, attn_buf, H, attn_dim, lw->wo_type);
+                }
+
+                if (q_gate_buf) _freea(q_gate_buf);
+                if (k_buf) _freea(k_buf);
+                if (v_buf) _freea(v_buf);
+                if (attn_buf) _freea(attn_buf);
+                if (gate_buf_std) _freea(gate_buf_std);
             } else {
-                /* === STANDARD GQA ATTENTION (every 4th layer) === */
-                /* TODO: implement full GQA — zero output for now */
+                /* Standard attention layer but weights not loaded — zero output */
             }
 
             /* Residual add */
@@ -909,7 +1095,7 @@ int main(int argc, char** argv) {
                     gate_data = cached;
 
                     /* Try to promote to GPU cache */
-                    if (use_gpu && gpu_expert_cache_count() < 240) { /* limit: 240 × 7.6MB = 1.8GB, 248MB headroom */
+                    if (use_gpu && gpu_expert_cache_count() < 50) { /* limit: reduced — GQA weights take 1.6GB VRAM */
                         gpu_cache_expert(layer, eid,
                             cached, (int)lw->gate_per_expert,
                             (char*)cached + lw->gate_per_expert, (int)lw->up_per_expert,
@@ -1051,8 +1237,54 @@ int main(int argc, char** argv) {
 
             if (normed_q8k) _freea(normed_q8k);
 
+            /* 2j-shared. Shared expert FFN (always active, added to moe_out) */
+            if (lw->shexp_gate && lw->shexp_up && lw->shexp_down) {
+                /* Gate + Up projections: [hidden → intermediate] */
+                quant_matvec(gate_buf, lw->shexp_gate, normed, I, H, lw->shexp_gate_type);
+                quant_matvec(up_buf, lw->shexp_up, normed, I, H, lw->shexp_up_type);
+
+                /* SwiGLU activation */
+                for (i = 0; i + 7 < I; i += 8) {
+                    __m256 vg = _mm256_loadu_ps(gate_buf + i);
+                    __m256 vu = _mm256_loadu_ps(up_buf + i);
+                    __m256 vabs = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), vg);
+                    __m256 vdenom = _mm256_add_ps(_mm256_set1_ps(1.0f), vabs);
+                    __m256 vsig = _mm256_add_ps(_mm256_set1_ps(0.5f),
+                                  _mm256_mul_ps(_mm256_set1_ps(0.5f), _mm256_div_ps(vg, vdenom)));
+                    _mm256_storeu_ps(act_buf + i, _mm256_mul_ps(_mm256_mul_ps(vg, vsig), vu));
+                }
+                for (; i < I; i++) {
+                    float g = gate_buf[i];
+                    float sig = 0.5f + 0.5f * g / (1.0f + fabsf(g));
+                    act_buf[i] = g * sig * up_buf[i];
+                }
+
+                /* Down projection: [intermediate → hidden] */
+                quant_matvec(expert_out, lw->shexp_down, act_buf, H, I, lw->shexp_down_type);
+
+                /* Add shared expert output to moe_out (weight=1, always active) */
+                for (i = 0; i + 7 < H; i += 8) {
+                    __m256 vm = _mm256_loadu_ps(moe_out + i);
+                    __m256 ve = _mm256_loadu_ps(expert_out + i);
+                    _mm256_storeu_ps(moe_out + i, _mm256_add_ps(vm, ve));
+                }
+                for (; i < H; i++) moe_out[i] += expert_out[i];
+            }
+
             /* 2k. Residual add */
             for (i = 0; i < H; i++) hidden[i] = residual[i] + moe_out[i];
+
+            /* DEBUG: track hidden state magnitude per layer (first token only) */
+            if (tok == 0 && layer <= 20) {
+                float hmag = 0; for (i = 0; i < H; i++) hmag += hidden[i] * hidden[i];
+                hmag = sqrtf(hmag / H);
+                float omag = 0; for (i = 0; i < H; i++) omag += o_out[i] * o_out[i];
+                omag = sqrtf(omag / H);
+                float mmag = 0; for (i = 0; i < H; i++) mmag += moe_out[i] * moe_out[i];
+                mmag = sqrtf(mmag / H);
+                fprintf(stderr, "  L%d: h_rms=%.2f attn_rms=%.4f moe_rms=%.4f%s\n",
+                    layer, hmag, omag, mmag, layers[layer].is_deltanet ? " [DN]" : " [GQA]");
+            }
 
             /* Debug: trace per layer */
             if (tok == 0 && (layer == 0 || layer == cfg.num_layers - 1)) {
@@ -1075,6 +1307,13 @@ int main(int argc, char** argv) {
             memcpy(normed, hidden, H * sizeof(float));
         }
 
+        /* Debug: hidden state before LM head */
+        if (tok <= 12) {
+            float hmax = 0; for (i = 0; i < H; i++) if (fabsf(normed[i]) > hmax) hmax = fabsf(normed[i]);
+            fprintf(stderr, "  Pre-LM[%d]: normed[0..3]=%.4f %.4f %.4f %.4f  max=%.4f\n",
+                    tok, normed[0], normed[1], normed[2], normed[3], hmax);
+        }
+
         /* 4. LM head — project to vocab */
         if (lm_head) {
             quant_matvec(logits, lm_head, normed, vocab_size, H, lm_head_type);
@@ -1084,7 +1323,7 @@ int main(int argc, char** argv) {
         }
 
         /* Debug: logits */
-        if (tok == 0) {
+        if (tok <= 12) {
             float lmax = logits[0]; int lmax_id = 0;
             for (i = 1; i < vocab_size; i++) {
                 if (logits[i] > lmax) { lmax = logits[i]; lmax_id = i; }
@@ -1110,12 +1349,19 @@ int main(int argc, char** argv) {
         QueryPerformanceCounter(&tok_end);
         double tok_ms = (double)(tok_end.QuadPart - tok_start.QuadPart) / freq.QuadPart * 1000.0;
 
-        cur_token = best_token;
+        /* During prompt: use next prompt token. After prompt: use generated token. */
+        if (tok + 1 < prompt_len) {
+            cur_token = prompt_tokens[tok + 1];
+            best_token = cur_token;
+        } else {
+            cur_token = best_token;
+        }
         tokens_generated++;
 
-        fprintf(stderr, "Token %d: id=%d (%.1f ms) [attn=%.0f expert=%.0f router=%.0f]\n",
+        fprintf(stderr, "Token %d: id=%d (%.1f ms) [attn=%.0f expert=%.0f router=%.0f]%s\n",
                 tok, best_token, tok_ms,
-                prof_attn_ms, prof_expert_io_ms, prof_router_ms);
+                prof_attn_ms, prof_expert_io_ms, prof_router_ms,
+                tok < prompt_len ? " [prompt]" : "");
         /* Print token IDs to stdout for output capture */
         printf("%d ", best_token);
         fflush(stdout);

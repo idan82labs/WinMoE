@@ -52,6 +52,20 @@ float* gpu_get_qkv_out(int slot);
 float* gpu_get_gate_out(int slot);
 float* gpu_get_ssm_out_buf(int slot);
 
+/* GPU Standard Attention (GQA) */
+int gpu_upload_gqa_weights(int layer,
+    const void* wq_q8, int wq_rows, int wq_cols,
+    const void* wk_q8, int wk_rows, int wk_cols,
+    const void* wv_q8, int wv_rows, int wv_cols,
+    const void* wo_q8, int wo_rows, int wo_cols);
+int gpu_gqa_projections(int layer,
+    const float* normed, int hidden_dim,
+    float* q_gate_out, int q_gate_dim,
+    float* k_out, int k_dim, float* v_out, int v_dim);
+int gpu_gqa_output(int layer,
+    const float* attn_out, int attn_dim,
+    float* output, int hidden_dim);
+
 /* GPU Router */
 int gpu_upload_router(int layer, const float* weights, int hidden_dim, int num_experts);
 int gpu_router(int layer, const float* normed, int hidden_dim, float* logits_out, int num_experts);

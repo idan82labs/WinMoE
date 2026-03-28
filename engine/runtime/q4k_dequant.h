@@ -40,26 +40,23 @@ typedef struct {
  *   bytes 4-7:  low 4 bits of mins[0..7]
  *   bytes 8-11: high 2 bits of scales[0..7] and mins[0..7]
  */
-static inline void decode_q4k_scales(const uint8_t* packed, uint8_t* scales, uint8_t* mins) {
-    /* Low 4 bits of scales */
-    scales[0] = packed[0] & 0x3F;
-    scales[1] = packed[0] >> 6 | (packed[1] & 0x0F) << 2;
-    scales[2] = packed[1] >> 4 | (packed[2] & 0x03) << 4;
-    scales[3] = packed[2] >> 2;
-    scales[4] = packed[3] & 0x3F;
-    scales[5] = packed[3] >> 6 | (packed[4] & 0x0F) << 2;
-    scales[6] = packed[4] >> 4 | (packed[5] & 0x03) << 4;
-    scales[7] = packed[5] >> 2;
-
-    /* Mins */
-    mins[0] = packed[6] & 0x3F;
-    mins[1] = packed[6] >> 6 | (packed[7] & 0x0F) << 2;
-    mins[2] = packed[7] >> 4 | (packed[8] & 0x03) << 4;
-    mins[3] = packed[8] >> 2;
-    mins[4] = packed[9] & 0x3F;
-    mins[5] = packed[9] >> 6 | (packed[10] & 0x0F) << 2;
-    mins[6] = packed[10] >> 4 | (packed[11] & 0x03) << 4;
-    mins[7] = packed[11] >> 2;
+static inline void decode_q4k_scales(const uint8_t* q, uint8_t* scales, uint8_t* mins) {
+    /* GGML Q4_K scale layout (get_scale_min_k4):
+     * bytes 0-3: low 6 bits of scales[0..3]
+     * bytes 4-7: low 6 bits of mins[0..3]
+     * bytes 8-11: high bits for sub-blocks 4-7 + remaining 2 bits from 0-3 */
+    scales[0] = q[0] & 63;  mins[0] = q[4] & 63;
+    scales[1] = q[1] & 63;  mins[1] = q[5] & 63;
+    scales[2] = q[2] & 63;  mins[2] = q[6] & 63;
+    scales[3] = q[3] & 63;  mins[3] = q[7] & 63;
+    scales[4] = (q[8]  & 0xF) | ((q[0] >> 6) << 4);
+    scales[5] = (q[9]  & 0xF) | ((q[1] >> 6) << 4);
+    scales[6] = (q[10] & 0xF) | ((q[2] >> 6) << 4);
+    scales[7] = (q[11] & 0xF) | ((q[3] >> 6) << 4);
+    mins[4]   = (q[8]  >> 4)  | ((q[4] >> 6) << 4);
+    mins[5]   = (q[9]  >> 4)  | ((q[5] >> 6) << 4);
+    mins[6]   = (q[10] >> 4)  | ((q[6] >> 6) << 4);
+    mins[7]   = (q[11] >> 4)  | ((q[7] >> 6) << 4);
 }
 
 /*

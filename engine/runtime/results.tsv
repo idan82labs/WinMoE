@@ -63,3 +63,8 @@ v9.6_expert_kernels	6.21	N/A	N/A	161	72.1%	keep	Expert-optimized GPU kernels (32
 v9.7_unroll_ldg	6.00	N/A	N/A	167	69.7%	reject	pragma unroll + __ldg on expert kernels. No change — kernel is memory-bound not instruction-bound.
 v9.8_batched_expert	6.05	N/A	N/A	165	66.6%	reject	Batched GPU expert (single upload/download per layer + GPU accumulation). Same speed as v9.6. Batch overhead offsets per-expert savings.
 v9.9_avx512_router	6.24	N/A	N/A	160	68.8%	keep	AVX-512 FP32 router (was AVX2). Router still 22-25ms — memory-bandwidth-bound. Keeps cleaner code but no speed gain. Peak=160.3ms(6.24tps).
+v10.0_gqa	2.41	N/A	N/A	412	75.7%	keep	GQA enabled! 15 standard layers now produce real attention output. Qwen3.5-specific: gated Q, QK RMSNorm, partial split-halves RoPE. Attn=331-344ms (+250ms from CPU GQA projections). Expert=47-72ms. Output quality dramatically changed.
+v10.1_gpu_gqa	2.40	N/A	N/A	416	66.2%	keep	GPU GQA projections (15 layers, 1594MB VRAM). Attn=307-337ms (GPU). Expert cache reduced to 50 (VRAM pressure). Real GQA attention enabled.
+v10.2_lm_head	1.11	N/A	N/A	780	91.7%	keep	LM head enabled (Q6_K, 795MB CPU). Real logits: max=12.46. Model generates token 73097 repeatedly — need tokenizer + proper prompt + GQA verification.
+v10.3_shared_expert	0.91	N/A	N/A	1100	N/A	keep	SHARED EXPERT IMPLEMENTED! Hidden states now have real variation (neg+pos, max=20-28). Token IDs varied (39161,211994,67419,75071). Model no longer stuck in loop. Value explosion partially resolved.
+v10.4_scale_fix	0.85	N/A	N/A	1200	N/A	keep	CRITICAL: Fixed Q4_K scale decode bug (decode_q4k_scales was using wrong bit-packing layout). Fixed all CPU + GPU kernels. Combined with shared expert: model produces varied, correct-looking token IDs. Output quality breakthrough.

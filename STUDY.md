@@ -2309,3 +2309,36 @@ The DeltaNet improvement (-42%) is a secondary effect: faster expert kernels mea
 5. **GQA attention for standard layers**: 15 of 60 layers use standard multi-head attention but currently output zeros. Implementing proper GQA with KV cache would improve output quality (required for publication).
 
 6. **LM head on GPU**: Currently skipped (834 MB). Needed for real text generation.
+
+---
+
+## 22. GQA + LM Head Integration (v10.0-v10.2)
+
+### 22.1 GQA Attention Enabled — v10.0 (2.41 tok/s)
+
+The 15 standard GQA attention layers (every 4th layer) were enabled with full Qwen3.5-specific features identified by ML expert consultation:
+
+1. **Gated Q projection**: Q weight outputs doubled dimensions [4096 → 16384] containing interleaved Q and sigmoid gate. After attention: `output *= sigmoid(gate)`.
+2. **QK RMSNorm**: Per-head RMSNorm on Q and K before RoPE, using `attn_q_norm.weight` and `attn_k_norm.weight` (shape [head_dim]).
+3. **Partial split-halves RoPE**: Only 25% of head dimensions rotated (64 of 256). Uses split-halves pattern (not interleaved pairs). Theta = 10M.
+4. **Standard attention dimensions**: 32 Q heads, 2 KV heads, head_dim=256 (different from DeltaNet's 64 heads, head_dim=128).
+
+All CPU Q8_0 matmul. Result: **2.41 tok/s** — GQA projections add ~250ms/token on CPU.
+
+### 22.2 GPU GQA Projections — v10.1 (2.40 tok/s)
+
+Uploaded Q/K/V/O weights for 15 standard layers to GPU (1594 MB Q8_0). VRAM total: 7714 MB (6120 DeltaNet + 1594 GQA). Only 478 MB free for expert cache (from 1.8 GB).
+
+Trade-off: attention dropped 344→307ms (GPU helps) but expert cache reduced from 240 to ~50 experts, increasing miss rate. Net: similar speed.
+
+### 22.3 LM Head Enabled — v10.2 (1.11 tok/s)
+
+Loaded the Q6_K LM head (795 MB) on CPU. Real logits now computed: max logit=12.46 at token 73097. The Q6_K matmul [4096 → 248320] adds ~450ms/token on CPU.
+
+**Output quality issue**: Model generates token 73097 repeatedly regardless of input or prompt. This indicates a potential bug in the GQA implementation (most likely in the Qwen3.5-specific features: gated Q deinterleaving, QK norms, or partial split-halves RoPE). Debugging in progress.
+
+### 22.4 GGUF Parser Fix
+
+Discovered missing Q8_0 type in the GGUF parser's block size tables. Embedding tensor data_size was reported as 4 GB (FP32 fallback) instead of 1.08 GB (correct Q8_0). Fix added `GGML_TYPE_Q8_0` constant but caused a GPU upload hang — reverted pending investigation. The per-token embedding reading code uses its own Q8_0 calculations and works correctly despite the parser issue.
+
+**65 experiments logged in results.tsv.**
