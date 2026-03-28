@@ -155,6 +155,11 @@ static void close_shard_handles(GGUFModel* model) {
     g_handles_open = 0;
 }
 
+/* Undo GGUF +1 norm weight convention: stored as (weight + 1), subtract 1 */
+static void undo_norm_plus1(float* w, int n) {
+    for (int i = 0; i < n; i++) w[i] -= 1.0f;
+}
+
 /* Load tensor from correct shard using persistent handles */
 static void* load_tensor_data(GGUFModel* model, TensorInfo* tensor, int* out_size) {
     int shard = tensor->shard;
@@ -204,12 +209,14 @@ static int load_shared_weights(const char* gguf_path, GGUFModel* model,
         TensorInfo* t = find_tensor(model, name);
         if (t) {
             layers[l].attn_norm = (float*)load_tensor_data(model, t, &size);
+            /* No +1 convention for Qwen3.5 — norm weights are actual trained values */
         }
 
         snprintf(name, 256, "blk.%d.ffn_norm.weight", l);
         t = find_tensor(model, name);
         if (t) {
             layers[l].ffn_norm = (float*)load_tensor_data(model, t, &size);
+            /* No +1 convention */
         }
 
         /* Detect layer type: DeltaNet (has ssm_a) vs full attention (has attn_q) */
@@ -338,6 +345,7 @@ static int load_shared_weights(const char* gguf_path, GGUFModel* model,
         t = find_tensor(model, name);
         if (t) {
             layers[l].post_attn_norm = (float*)load_tensor_data(model, t, &size);
+            /* No +1 convention */
         }
 
         /* Router gate */
@@ -513,6 +521,7 @@ int main(int argc, char** argv) {
     }
     if (output_norm) {
         final_norm = (float*)load_tensor_data(&model, output_norm, &sz);
+        /* No +1 convention for Qwen3.5 norms — values ~1.7 are actual trained weights */
     }
     if (output_weight) {
         lm_head_type = output_weight->type;
@@ -844,6 +853,27 @@ int main(int argc, char** argv) {
                     float* gpu_qkv = gpu_get_qkv_out(slot_idx);
                     float* gpu_gate = gpu_get_gate_out(slot_idx);
 
+                    /* L0 debug: print values at each stage */
+                    if (tok == 0 && layer == 0 && lw->ssm_conv1d_w) {
+                        /* Conv1d weight: [channels=12288, kernel=4] in GGML layout */
+                        fprintf(stderr, "  conv1d_w[ch0][k0..3]: %.6f %.6f %.6f %.6f\n",
+                            lw->ssm_conv1d_w[0], lw->ssm_conv1d_w[1],
+                            lw->ssm_conv1d_w[2], lw->ssm_conv1d_w[3]);
+                        /* Conv weight layout: [4, 12288] → weight[k][channel] = w[k * 12288 + ch] */
+                        /* For channel 0: w[0], w[12288], w[24576], w[36864] = kernel positions 0-3 */
+                    }
+                    if (tok == 0 && layer == 0) {
+                        fprintf(stderr, "=== L0 VALIDATION (tok=0) ===\n");
+                        fprintf(stderr, "  normed[0..7]: %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f\n",
+                            normed[0], normed[1], normed[2], normed[3],
+                            normed[4], normed[5], normed[6], normed[7]);
+                        fprintf(stderr, "  qkv_pre_conv[0..7]: %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f\n",
+                            gpu_qkv[0], gpu_qkv[1], gpu_qkv[2], gpu_qkv[3],
+                            gpu_qkv[4], gpu_qkv[5], gpu_qkv[6], gpu_qkv[7]);
+                        fprintf(stderr, "  gate[0..3]: %.6f %.6f %.6f %.6f\n",
+                            gpu_gate[0], gpu_gate[1], gpu_gate[2], gpu_gate[3]);
+                    }
+
                     /* Apply conv1d to QKV before state recurrence */
                     if (lw->ssm_conv1d_w) {
                         DeltaNetState* ds = &dn_states[layer];
@@ -854,11 +884,30 @@ int main(int argc, char** argv) {
                             float sum = 0.0f;
                             for (int k = 0; k < DN_CONV_WIDTH; k++) {
                                 int hs = ((ds->conv_pos - 1 - k) % DN_CONV_WIDTH + DN_CONV_WIDTH) % DN_CONV_WIDTH;
-                                sum += lw->ssm_conv1d_w[k * DN_QKV_DIM + i] * ds->conv_buf[hs * DN_QKV_DIM + i];
+                                /* Kernel reversed: k=0 maps to oldest, kernel_size-1-k maps to newest */
+                                sum += lw->ssm_conv1d_w[i * DN_CONV_WIDTH + (DN_CONV_WIDTH - 1 - k)] * ds->conv_buf[hs * DN_QKV_DIM + i];
                             }
                             float sig = 1.0f / (1.0f + expf(-sum));
                             gpu_qkv[i] = sum * sig; /* SiLU */
                         }
+                    }
+
+                    if (tok == 0 && layer == 0) {
+                        fprintf(stderr, "  qkv_post_conv[0..7]: %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f\n",
+                            gpu_qkv[0], gpu_qkv[1], gpu_qkv[2], gpu_qkv[3],
+                            gpu_qkv[4], gpu_qkv[5], gpu_qkv[6], gpu_qkv[7]);
+                        /* Also print Q/K/V split points */
+                        fprintf(stderr, "  Q[0..3]: %.6f %.6f %.6f %.6f\n",
+                            gpu_qkv[0], gpu_qkv[1], gpu_qkv[2], gpu_qkv[3]);
+                        fprintf(stderr, "  K[0..3]: %.6f %.6f %.6f %.6f\n",
+                            gpu_qkv[DN_KEY_DIM], gpu_qkv[DN_KEY_DIM+1], gpu_qkv[DN_KEY_DIM+2], gpu_qkv[DN_KEY_DIM+3]);
+                        fprintf(stderr, "  V[0..3]: %.6f %.6f %.6f %.6f\n",
+                            gpu_qkv[2*DN_KEY_DIM], gpu_qkv[2*DN_KEY_DIM+1], gpu_qkv[2*DN_KEY_DIM+2], gpu_qkv[2*DN_KEY_DIM+3]);
+                        fprintf(stderr, "  alpha[0..3]: %.6f %.6f %.6f %.6f\n",
+                            alpha_raw[0], alpha_raw[1], alpha_raw[2], alpha_raw[3]);
+                        fprintf(stderr, "  ssm_a[0..3]: %.6f %.6f %.6f %.6f\n",
+                            lw->ssm_a ? lw->ssm_a[0] : 0, lw->ssm_a ? lw->ssm_a[1] : 0,
+                            lw->ssm_a ? lw->ssm_a[2] : 0, lw->ssm_a ? lw->ssm_a[3] : 0);
                     }
 
                     /* CPU: DeltaNet state recurrence using GPU's QKV output */
@@ -969,6 +1018,12 @@ int main(int argc, char** argv) {
                     /* SYNC: Wait for SSM Out result */
                     gpu_wait_ssm_out(slot_idx);
                     memcpy(o_out, gpu_get_ssm_out_buf(slot_idx), H * sizeof(float));
+                    if (tok == 0 && layer == 0) {
+                        fprintf(stderr, "  o_out[0..7]: %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f\n",
+                            o_out[0], o_out[1], o_out[2], o_out[3],
+                            o_out[4], o_out[5], o_out[6], o_out[7]);
+                        fprintf(stderr, "=== END L0 VALIDATION ===\n");
+                    }
 
                 } else if (lw->w_qkv) {
                     /* === CPU FALLBACK: GATED DELTANET === */
@@ -1457,15 +1512,29 @@ int main(int argc, char** argv) {
             for (i = 0; i < vocab_size; i++) logits[i] = normed[i % H];
         }
 
-        /* Debug: logits */
-        if (tok <= 12) {
-            float lmax = logits[0]; int lmax_id = 0;
-            for (i = 1; i < vocab_size; i++) {
-                if (logits[i] > lmax) { lmax = logits[i]; lmax_id = i; }
+        /* Debug: top-10 logits + check for expected token */
+        if (tok == prompt_len - 1 || tok == prompt_len) {
+            /* Find top-10 */
+            int top_ids[10] = {0}; float top_vals[10];
+            for (i = 0; i < 10; i++) top_vals[i] = -1e30f;
+            for (i = 0; i < vocab_size; i++) {
+                if (logits[i] > top_vals[9]) {
+                    top_vals[9] = logits[i]; top_ids[9] = i;
+                    /* Bubble up */
+                    for (int j = 8; j >= 0; j--) {
+                        if (top_vals[j+1] > top_vals[j]) {
+                            float tv = top_vals[j]; top_vals[j] = top_vals[j+1]; top_vals[j+1] = tv;
+                            int ti = top_ids[j]; top_ids[j] = top_ids[j+1]; top_ids[j+1] = ti;
+                        }
+                    }
+                }
             }
-            fprintf(stderr, "Logits: [0]=%.4f [1]=%.4f max=%.4f at id=%d\n",
-                    logits[0], logits[1], lmax, lmax_id);
-            /* Also check for NaN in logits */
+            fprintf(stderr, "Top-10 logits [tok=%d]:\n", tok);
+            for (i = 0; i < 10; i++)
+                fprintf(stderr, "  #%d: id=%d logit=%.4f\n", i+1, top_ids[i], top_vals[i]);
+            /* Check where expected token ranks */
+            fprintf(stderr, "  Token 151644 (<|im_start|>) logit=%.4f\n", logits[151644]);
+            fprintf(stderr, "  Token 151646 (<|think|>?) logit=%.4f\n", logits[151646]);
             int nan_count = 0;
             for (i = 0; i < vocab_size; i++) if (logits[i] != logits[i]) nan_count++;
             if (nan_count > 0) fprintf(stderr, "WARNING: %d NaN logits!\n", nan_count);
