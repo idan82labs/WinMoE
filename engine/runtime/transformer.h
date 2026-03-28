@@ -160,27 +160,21 @@ static void quant_matvec(float* out, const void* W, const float* x,
             q8_matvec(out, W, x, out_dim, in_dim);
             break;
         default:
-            /* FP32 matmul with AVX2 + OpenMP */
+            /* FP32 matmul with AVX-512 + OpenMP */
             {
                 const float* wf = (const float*)W;
                 int r;
                 #pragma omp parallel for schedule(static) if(out_dim >= 64)
                 for (r = 0; r < out_dim; r++) {
                     const float* row = wf + r * in_dim;
-                    __m256 acc = _mm256_setzero_ps();
+                    __m512 acc512 = _mm512_setzero_ps();
                     int c;
-                    for (c = 0; c + 7 < in_dim; c += 8) {
-                        __m256 vw = _mm256_loadu_ps(row + c);
-                        __m256 vx = _mm256_loadu_ps(x + c);
-                        acc = _mm256_fmadd_ps(vw, vx, acc);
+                    for (c = 0; c + 15 < in_dim; c += 16) {
+                        __m512 vw = _mm512_loadu_ps(row + c);
+                        __m512 vx = _mm512_loadu_ps(x + c);
+                        acc512 = _mm512_fmadd_ps(vw, vx, acc512);
                     }
-                    __m128 hi = _mm256_extractf128_ps(acc, 1);
-                    __m128 lo = _mm256_castps256_ps128(acc);
-                    __m128 s4 = _mm_add_ps(lo, hi);
-                    s4 = _mm_hadd_ps(s4, s4);
-                    s4 = _mm_hadd_ps(s4, s4);
-                    float s;
-                    _mm_store_ss(&s, s4);
+                    float s = _mm512_reduce_add_ps(acc512);
                     for (; c < in_dim; c++) s += row[c] * x[c];
                     out[r] = s;
                 }
