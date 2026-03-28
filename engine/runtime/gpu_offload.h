@@ -70,6 +70,12 @@ int gpu_expert_down(int cache_idx, const float* act, int intermediate,
 /* Fully fused: gate+up+swiglu+down all on GPU, single upload/download */
 int gpu_expert_ffn_fused(int cache_idx, const float* input, int hidden_dim,
     int intermediate, float* expert_out);
+
+/* Batched expert API — single upload/download per layer */
+int gpu_expert_batch_start(const float* normed, int hidden_dim);
+int gpu_expert_batch_add(int cache_idx, int hidden_dim, int intermediate, float weight);
+int gpu_expert_batch_finish(float* moe_out, int hidden_dim);
+
 int gpu_expert_cache_count(void);
 
 #ifdef __cplusplus

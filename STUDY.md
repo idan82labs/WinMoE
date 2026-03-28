@@ -2154,3 +2154,158 @@ The GPU expert cache strategy materialized successfully, achieving **3.18 tok/s*
 The CPU DDR4 path was bottlenecked at 174 ms expert FFN time because aggregate bandwidth under 10-thread contention plateaus at ~38 GB/s. By moving 51 of 60 expert layers to GDDR6 (256 GB/s), the expert compute time for hot layers dropped to ~85 ms (estimated for fully-cached run). The remaining CPU-bound layers contribute ~87 ms, yielding 172 ms total — and critically, the DDR4 bus now services only 9 out of 60 expert layers plus lower-contention vector streaming, allowing per-thread effective bandwidth to recover.
 
 **51 total experiments logged in results.tsv** (encompassing Phases 3, 4, and 5 optimization attempts). This run (v8.3) validates the GPU expert cache as a viable path forward and opens Phase 5 scope for hot-tier tuning and warm-tier PCIe scheduling.
+
+### 19.9 GPU Expert Cache Tuning — 3.36 tok/s (v8.5-v8.6)
+
+Systematic sweeps of the GPU expert cache limit revealed that **150 cached experts** was the optimal balance between VRAM pressure and cache hit rate. More experts (200+) caused GPU memory fragmentation that degraded DeltaNet kernel performance. Fewer experts (<100) insufficient for meaningful hit rates.
+
+- v8.4: 20-token run, steady-state 3.19 tok/s, 60.2% hit rate
+- v8.5: Cache capped at 150, token 9 at 302 ms (3.31 tok/s), 68.3% hit rate
+- v8.6: Limit sweep confirms 150 optimal, token 9 at 298 ms (**3.36 tok/s**), **67.2x from v5.0**
+
+### 19.10 GPU Router Experiment — Rejected (v8.7)
+
+Moving the FP32 router matmul [4096→512] to GPU saved ~20 ms per token but consumed 480 MB VRAM, displacing hot experts from the GPU cache. The net effect was negative: 0.67 tok/s (from 3.36), a catastrophic regression. **VRAM is more valuable for expert cache than for router acceleration.** Reverted.
+
+### 19.11 K=3 Exploration — 4.44 tok/s (v8.8)
+
+Reducing expert count from K=4 to K=3 yielded 4.44 tok/s (225 ms/token) — a 32% improvement from fewer expert computations per layer. However, this was set aside: the research goal requires K=4 minimum for model quality. The result validates that expert FFN compute is the dominant bottleneck.
+
+### 19.12 GPU Shared Memory Input Caching — 4.37 tok/s at K=4 (v8.9)
+
+A critical GPU kernel optimization: caching the input activation vector in CUDA shared memory (`extern __shared__ float s_input[]`) so all threads in a block read from fast on-chip SRAM instead of global VRAM. Applied to the Q8_0 DeltaNet kernel.
+
+**Result:** DeltaNet projection time dropped from 115 ms to **64 ms** (1.8x speedup). Combined with other improvements: **4.37 tok/s at K=4** (229 ms/token), **87.4x from v5.0**.
+
+This optimization was also applied to the Q4_K and Q5_K GPU expert kernels, though a bug in the Q5_K kernel (reading from global `input` instead of `s_input`) was found and fixed in v9.0.
+
+---
+
+## 20. Phase 5: Fused GPU Expert Pipeline (v9.0-v9.4)
+
+### 20.1 The Expert FFN Bottleneck
+
+At v8.9, the per-token breakdown was:
+- DeltaNet: 64 ms (28%) — well-optimized with shared memory
+- Expert FFN: 136 ms (59%) — the new bottleneck
+- Router: 26 ms (11%)
+
+The GPU expert path had three performance problems:
+
+1. **`cudaMalloc`/`cudaFree` per expert call**: Each GPU-cached expert invoked `cudaMalloc` for temporary gate and up output buffers, then freed them. With K=4 × 60 layers = 240 expert calls per token, this produced hundreds of CUDA allocation syscalls.
+
+2. **CPU SwiGLU round-trip**: The activation function (SwiGLU) ran on CPU, requiring: GPU→CPU download of gate+up outputs, CPU SwiGLU computation, CPU→GPU upload of activations for the down projection. Four PCIe transfers per expert.
+
+3. **Q5_K shared memory bug**: The Q5_K GPU kernel loaded the input vector into shared memory but then read from global memory — the shared memory cache was wasted.
+
+### 20.2 Fused GPU Expert FFN (v9.0)
+
+All three issues were fixed in a single refactor:
+
+1. **Pre-allocated GPU buffers**: `d_expert_gate`, `d_expert_up`, `d_expert_act` allocated once via `ensure_expert_buffers()`, eliminating all per-call `cudaMalloc`/`cudaFree`.
+
+2. **GPU SwiGLU kernel**: A simple CUDA kernel (`swiglu_kernel`) computes `gate * sigmoid(gate) * up` entirely on GPU, using the same hard-sigmoid approximation as the CPU path for bit-exactness.
+
+3. **Single upload/download**: The fused `gpu_expert_ffn_fused()` function performs gate matmul → up matmul → SwiGLU → down matmul all on GPU with one H2D transfer (input) and one D2H transfer (output).
+
+**Result:** Peak token at 212.6 ms (**4.70 tok/s**), expert time for GPU-cached experts dropped to 44-71 ms (from 136 ms — roughly 50% reduction).
+
+### 20.3 Stream Separation Experiments — Rejected (v9.1, v9.2)
+
+An attempt to run expert FFN on a dedicated CUDA stream (`g_stream_expert`) to avoid blocking DeltaNet launches on `g_stream_compute`. Two variants tested:
+
+- **v9.1** (non-pinned host memory): DeltaNet recovered to 58 ms (from 137 ms reported on shared stream) but expert rose to 183 ms. Total worse: 267 ms vs 216 ms.
+- **v9.2** (pinned host memory via `cudaMallocHost`): Same result. DeltaNet 57 ms, expert 176 ms, total 259 ms.
+
+**Finding:** On a single GPU, DeltaNet and expert kernels compete for the same SM resources. Separate streams cause SM contention with no net benefit. The shared-stream approach (v9.0b) is superior because serialized execution gives each kernel full GPU bandwidth. The "DeltaNet regression" in v9.0b (137 ms reported vs 64 ms actual) is a timing attribution artifact, not a real slowdown — expert kernel spillover inflates the DeltaNet measurement while total time improves.
+
+### 20.4 VRAM Budget Tuning (v9.3, v9.4)
+
+- **v9.3 (cache limit 250)**: 8020 MB VRAM utilization (97.9%) caused severe GPU memory pressure. DeltaNet regressed to 238-253 ms. Rejected.
+- **v9.4 (cache limit 240)**: Optimal balance — 1824 MB for experts, 248 MB headroom. Steady-state 225-235 ms, **4.47 tok/s peak**, 73.2% cache hit rate.
+
+### 20.5 GPU Router Retry — Rejected Again (v9.5)
+
+With the fused expert path established, we retested GPU router offload:
+- Router savings: 25 ms → 3-4 ms (saves 21 ms)
+- VRAM cost: 480 MB → expert cache reduced from 240 to 200 slots
+- Expert FFN regression: warm expert time rose from 42 ms to 56-116 ms
+- **Net negative**: 251 ms peak (3.98 tok/s) vs 224 ms (4.47 tok/s) without router
+
+This confirms the v8.7 finding: **on an 8 GB GPU where 6.1 GB is consumed by DeltaNet weights, every MB of remaining VRAM is more valuable as expert cache than for any other purpose.**
+
+### 20.6 v9.4 Baseline (4.47 tok/s, 89.4x from v5.0)
+
+**Best warm token: 223.9 ms = 4.47 tok/s at K=4**
+
+Profiled breakdown (steady-state, tokens 19-29):
+- DeltaNet (reported): 160-172 ms (includes ~100 ms of GPU expert spillover)
+- DeltaNet (actual GPU compute): ~64 ms
+- Expert FFN (warm, fused GPU): 41-67 ms
+- Router (CPU FP32): 16-18 ms
+- Other: ~2 ms
+
+### 20.7 Expert-Optimized GPU Kernels — 6.21 tok/s (v9.6)
+
+The single largest remaining optimization. The standard Q4_K/Q5_K GPU kernels launched 256 threads per output row, but with the Qwen3.5-397B expert intermediate dimension of 1024, only 4-16 threads per block performed useful work:
+
+- **Gate/Up projection** (in_dim=4096): `blocks_per_row = 4096/256 = 16`. Threads 16-255 idle (94% waste).
+- **Down projection** (in_dim=1024): `blocks_per_row = 1024/256 = 4`. Threads 4-255 idle (98% waste).
+
+**The fix: sub-block work distribution with 32-thread warp kernels.**
+
+Instead of assigning each thread a whole Q4_K block (256 weights), the new `q4k_expert_kernel` distributes work at the sub-block level (32 weights each). Total work units = `blocks_per_row × 8` sub-blocks:
+
+- Gate/Up: 16 × 8 = 128 sub-blocks ÷ 32 threads = **4 sub-blocks per thread** (full utilization)
+- Down: 4 × 8 = 32 sub-blocks ÷ 32 threads = **1 sub-block per thread** (full utilization)
+
+With only 32 threads (1 warp), the reduction simplifies to a single `__shfl_down_sync` cascade — no shared memory block reduction needed. The same pattern was applied to `q5k_expert_kernel` for the Q5_K down projection.
+
+**Result (v9.6, 30 tokens at K=4):**
+
+| Metric | v9.4 | v9.6 | Change |
+|--------|------|------|--------|
+| Best warm token | 223.9 ms | **160.9 ms** | **-28%** |
+| Steady-state avg | 235 ms | **170 ms** | **-28%** |
+| tok/s peak | 4.47 | **6.21** | **+39%** |
+| tok/s steady | 4.26 | **5.88** | **+38%** |
+| DeltaNet (reported) | 160-172 ms | 87-98 ms | -42% |
+| Expert (warm GPU) | 41-67 ms | 38-58 ms | -8% |
+
+The DeltaNet improvement (-42%) is a secondary effect: faster expert kernels mean fewer GPU cycles spent on expert work between layers, reducing the stream contention that inflated DeltaNet measurements. The expert FFN time itself only improved modestly (-8%) because the computation was already memory-bandwidth-bound — the gain comes from eliminating idle thread overhead (warp scheduling, register allocation, shared memory waste).
+
+**This is 124x from v5.0's 0.05 tok/s — a 397B parameter model at 6.21 tok/s on a $1200 consumer laptop.**
+
+**60 experiments logged in results.tsv.**
+
+---
+
+## 21. Optimization Exhaustion Analysis
+
+### 21.1 Attempted and Rejected Optimizations
+
+| Optimization | Version | Reason for Rejection |
+|---|---|---|
+| VNNI dpbusd for Q4_K/Q5_K | v7.6 | Per-sub-block 6-bit scales require hsum that negates dpbusd gain |
+| AVX-512 widening for Q4_K int | v7.7 | Nibble layout mismatch + expensive `_mm512_set_epi16` |
+| Multi-row Q4_K blocking | v7.8 | Activation already in L1 cache |
+| Software prefetch | v7.9 | HW prefetcher handles sequential access |
+| Thread count sweep | v8.1 | 10 threads optimal on 8P-core i7-11800H |
+| Prefetch + pre-alloc Q5_K | v8.2 | No meaningful change |
+| GPU router (twice) | v8.7, v9.5 | VRAM displacement exceeds router savings |
+| Expert stream separation | v9.1, v9.2 | SM contention on single GPU |
+| Expert cache limit 250 | v9.3 | VRAM pressure degrades DeltaNet |
+
+### 21.2 Remaining Optimization Opportunities (post-v9.6)
+
+1. ~~**GPU Q4_K/Q5_K kernel optimization**~~ — **DONE (v9.6)**. 32-thread sub-block kernels. 6.21 tok/s.
+
+2. **Huge pages** (`VirtualAlloc(MEM_LARGE_PAGES)`): The 20 GB expert RAM cache spans ~5.2M 4KB pages. 2MB huge pages would reduce TLB misses on cold expert reads. Estimated: 10-15 ms savings.
+
+3. **LRU expert cache eviction**: Current fill-only policy never evicts. LRU would maintain higher hit rates as token count grows and expert distribution shifts.
+
+4. **Further GPU kernel optimization**: Vectorized loads (float4), loop unrolling, register blocking for the expert kernels. The sub-block distribution fixed thread utilization but the per-weight computation is still scalar.
+
+5. **GQA attention for standard layers**: 15 of 60 layers use standard multi-head attention but currently output zeros. Implementing proper GQA with KV cache would improve output quality (required for publication).
+
+6. **LM head on GPU**: Currently skipped (834 MB). Needed for real text generation.

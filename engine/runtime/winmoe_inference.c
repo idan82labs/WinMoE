@@ -540,8 +540,8 @@ int main(int argc, char** argv) {
                     layers[i].w_ssm_out, inner, H);       /* SSM Out: [inner, hidden] */
             }
         }
-        /* Router stays on CPU — GPU VRAM reserved for experts */
         fprintf(stderr, "GPU VRAM used: %.0f MB\n", gpu_vram_used_mb());
+        /* Router stays on CPU — 480MB VRAM better spent on expert cache (v8.7, v9.5 confirmed) */
     } else {
         fprintf(stderr, "GPU init failed — running CPU-only\n");
     }
@@ -909,7 +909,7 @@ int main(int argc, char** argv) {
                     gate_data = cached;
 
                     /* Try to promote to GPU cache */
-                    if (use_gpu && gpu_expert_cache_count() < 200) { /* limit to avoid VRAM pressure */
+                    if (use_gpu && gpu_expert_cache_count() < 240) { /* limit: 240 × 7.6MB = 1.8GB, 248MB headroom */
                         gpu_cache_expert(layer, eid,
                             cached, (int)lw->gate_per_expert,
                             (char*)cached + lw->gate_per_expert, (int)lw->up_per_expert,

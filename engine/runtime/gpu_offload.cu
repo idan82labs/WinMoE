@@ -68,6 +68,7 @@ static PipelineSlot g_slots[NUM_PIPELINE_SLOTS];
 static cudaStream_t g_stream_compute = NULL;
 static cudaStream_t g_stream_h2d = NULL;
 static cudaStream_t g_stream_d2h = NULL;
+static cudaStream_t g_stream_expert = NULL;  /* Dedicated stream for expert FFN */
 static int g_initialized = 0;
 static float g_vram_used = 0;
 static int g_hidden_dim = 4096;
@@ -252,6 +253,128 @@ __global__ void q5k_matvec_kernel(float* output, const unsigned char* weights,
     }
 }
 
+/*
+ * Expert-optimized Q4_K kernel — 32 threads, sub-block work distribution
+ * For small in_dim (e.g. 1024-4096), the standard kernel wastes 94% of threads.
+ * This kernel distributes work at sub-block granularity (blocks_per_row * 8 units)
+ * and uses warp-only reduction (no block reduction needed for 32 threads).
+ */
+#define EXPERT_THREADS 32
+
+__global__ void q4k_expert_kernel(float* output, const unsigned char* weights,
+                                   const float* input, int in_dim, int out_dim) {
+    int row = blockIdx.x;
+    if (row >= out_dim) return;
+    int tid = threadIdx.x;
+    int blocks_per_row = in_dim / 256;
+    const unsigned char* row_data = weights + (long long)row * blocks_per_row * 144;
+
+    /* Cache input in shared memory — 32 threads load cooperatively */
+    extern __shared__ float s_input[];
+    for (int i = tid; i < in_dim; i += EXPERT_THREADS)
+        s_input[i] = input[i];
+    __syncthreads();
+
+    /* Distribute at sub-block level: blocks_per_row * 8 work units */
+    float partial = 0.0f;
+    int total_subs = blocks_per_row * 8;
+
+    for (int si = tid; si < total_subs; si += EXPERT_THREADS) {
+        int b = si / 8;
+        int sub = si % 8;
+
+        const unsigned char* blk = row_data + b * 144;
+        half d_h, dmin_h;
+        memcpy(&d_h, blk, 2);
+        memcpy(&dmin_h, blk + 2, 2);
+        float d = __half2float(d_h);
+        float dmin = __half2float(dmin_h);
+
+        const unsigned char* sc = blk + 4;
+        const unsigned char* qs = blk + 16;
+
+        int scale_val = sc[sub < 4 ? sub : sub + 2] & 0x3F;
+        int min_val = sc[sub < 4 ? sub + 4 : sub + 6] & 0x3F;
+        float sc_f = d * (float)scale_val;
+        float mn_f = dmin * (float)min_val;
+
+        float sub_sum = 0.0f;
+        const unsigned char* qp = qs + sub * 16;
+        int base_idx = b * 256 + sub * 32;
+        #pragma unroll
+        for (int j = 0; j < 16; j++) {
+            unsigned char packed = __ldg(qp + j);
+            float w0 = sc_f * (float)(packed & 0x0F) - mn_f;
+            float w1 = sc_f * (float)(packed >> 4) - mn_f;
+            sub_sum += w0 * s_input[base_idx + j * 2] + w1 * s_input[base_idx + j * 2 + 1];
+        }
+        partial += sub_sum;
+    }
+
+    /* Warp-only reduction (32 threads = 1 warp, no block reduction needed) */
+    for (int offset = 16; offset > 0; offset >>= 1)
+        partial += __shfl_down_sync(0xFFFFFFFF, partial, offset);
+    if (tid == 0) output[row] = partial;
+}
+
+/* Expert-optimized Q5_K kernel — same pattern as Q4_K but with high-bit extraction */
+__global__ void q5k_expert_kernel(float* output, const unsigned char* weights,
+                                   const float* input, int in_dim, int out_dim) {
+    int row = blockIdx.x;
+    if (row >= out_dim) return;
+    int tid = threadIdx.x;
+    int blocks_per_row = in_dim / 256;
+    const unsigned char* row_data = weights + (long long)row * blocks_per_row * 176;
+
+    extern __shared__ float s_input[];
+    for (int i = tid; i < in_dim; i += EXPERT_THREADS)
+        s_input[i] = input[i];
+    __syncthreads();
+
+    float partial = 0.0f;
+    int total_subs = blocks_per_row * 8;
+
+    for (int si = tid; si < total_subs; si += EXPERT_THREADS) {
+        int b = si / 8;
+        int sub = si % 8;
+
+        const unsigned char* blk = row_data + b * 176;
+        half d_h, dmin_h;
+        memcpy(&d_h, blk, 2);
+        memcpy(&dmin_h, blk + 2, 2);
+        float d = __half2float(d_h);
+        float dmin = __half2float(dmin_h);
+
+        const unsigned char* sc = blk + 4;
+        const unsigned char* qh = blk + 16;
+        const unsigned char* qs = blk + 48;
+
+        int scale_val = sc[sub < 4 ? sub : sub + 2] & 0x3F;
+        int min_val = sc[sub < 4 ? sub + 4 : sub + 6] & 0x3F;
+        float sc_f = d * (float)scale_val;
+        float mn_f = dmin * (float)min_val;
+
+        float sub_sum = 0.0f;
+        const unsigned char* qp = qs + sub * 16;
+        int base_idx = b * 256 + sub * 32;
+        #pragma unroll
+        for (int j = 0; j < 16; j++) {
+            unsigned char packed = __ldg(qp + j);
+            int idx0 = sub * 32 + j * 2;
+            int q0 = (packed & 0x0F) | (((qh[idx0 / 8] >> (idx0 % 8)) & 1) << 4);
+            int q1 = (packed >> 4) | (((qh[(idx0+1) / 8] >> ((idx0+1) % 8)) & 1) << 4);
+            float w0 = sc_f * (float)q0 - mn_f;
+            float w1 = sc_f * (float)q1 - mn_f;
+            sub_sum += w0 * s_input[base_idx + j * 2] + w1 * s_input[base_idx + j * 2 + 1];
+        }
+        partial += sub_sum;
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1)
+        partial += __shfl_down_sync(0xFFFFFFFF, partial, offset);
+    if (tid == 0) output[row] = partial;
+}
+
 /* SwiGLU kernel — gate * sigmoid(gate) * up, all on GPU */
 __global__ void swiglu_kernel(float* output, const float* gate, const float* up, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -260,6 +383,18 @@ __global__ void swiglu_kernel(float* output, const float* gate, const float* up,
         float sig = 0.5f + 0.5f * g / (1.0f + fabsf(g)); /* hard sigmoid — matches CPU */
         output[i] = g * sig * up[i];
     }
+}
+
+/* Weighted accumulation: moe_out[i] += weight * expert_out[i] */
+__global__ void weighted_add_kernel(float* moe_out, const float* expert_out, float weight, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) moe_out[i] += weight * expert_out[i];
+}
+
+/* Zero buffer kernel */
+__global__ void zero_kernel(float* buf, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) buf[i] = 0.0f;
 }
 
 /* Forward declarations for io buffers */
@@ -271,7 +406,14 @@ static int d_io_size = 0;
 static float* d_expert_gate = NULL;
 static float* d_expert_up = NULL;
 static float* d_expert_act = NULL;
+static float* d_expert_input = NULL;   /* Dedicated device input for expert stream */
+static float* d_expert_output = NULL;  /* Dedicated device output for expert stream */
+static float* d_moe_out = NULL;        /* GPU accumulation buffer for batched experts */
+static int d_moe_out_size = 0;
+static float* h_expert_input = NULL;   /* PINNED host input for truly async H2D */
+static float* h_expert_output = NULL;  /* PINNED host output for truly async D2H */
 static int d_expert_buf_size = 0;
+static int d_expert_io_size = 0;
 
 static int ensure_io_buffers(int max_dim) {
     if (max_dim <= d_io_size) return 0;
@@ -292,6 +434,20 @@ static int ensure_expert_buffers(int intermediate) {
     cudaMalloc(&d_expert_up, intermediate * sizeof(float));
     cudaMalloc(&d_expert_act, intermediate * sizeof(float));
     d_expert_buf_size = intermediate;
+    return 0;
+}
+
+static int ensure_expert_io(int dim) {
+    if (dim <= d_expert_io_size) return 0;
+    if (d_expert_input) cudaFree(d_expert_input);
+    if (d_expert_output) cudaFree(d_expert_output);
+    if (h_expert_input) cudaFreeHost(h_expert_input);
+    if (h_expert_output) cudaFreeHost(h_expert_output);
+    cudaMalloc(&d_expert_input, dim * sizeof(float));
+    cudaMalloc(&d_expert_output, dim * sizeof(float));
+    cudaMallocHost(&h_expert_input, dim * sizeof(float));   /* Pinned for async */
+    cudaMallocHost(&h_expert_output, dim * sizeof(float));  /* Pinned for async */
+    d_expert_io_size = dim;
     return 0;
 }
 
@@ -380,36 +536,95 @@ extern "C" int gpu_expert_down(int cache_idx, const float* act, int intermediate
     return 0;
 }
 
-/* Fully fused GPU expert: gate+up+swiglu+down all on GPU, single upload/download */
+/* Fully fused GPU expert: gate+up+swiglu+down all on GPU, single upload/download
+ * Runs on g_stream_compute — serialized with DeltaNet gives best throughput
+ * (separate streams cause SM contention on single GPU, tested v9.1/v9.2) */
 extern "C" int gpu_expert_ffn_fused(int cache_idx, const float* input, int hidden_dim,
     int intermediate, float* expert_out)
 {
     GPUExpert* ge = &g_gpu_experts[cache_idx];
-    ensure_io_buffers(hidden_dim > intermediate ? hidden_dim : intermediate);
     ensure_expert_buffers(intermediate);
+    ensure_expert_io(hidden_dim > intermediate ? hidden_dim : intermediate);
 
-    /* Upload input ONCE */
-    CHECK_CUDA(cudaMemcpy(d_input_fp32, input, hidden_dim * sizeof(float), cudaMemcpyHostToDevice));
+    /* Upload input — sync copy to dedicated expert buffer */
+    CHECK_CUDA(cudaMemcpy(d_expert_input, input, hidden_dim * sizeof(float), cudaMemcpyHostToDevice));
 
-    /* Gate matmul on GPU */
-    q4k_matvec_kernel<<<intermediate, MATVEC_THREADS, hidden_dim * sizeof(float), g_stream_compute>>>(
-        d_expert_gate, (const unsigned char*)ge->d_gate, d_input_fp32, hidden_dim, intermediate);
+    /* Gate matmul — expert-optimized kernel (32 threads, full utilization) */
+    q4k_expert_kernel<<<intermediate, EXPERT_THREADS, hidden_dim * sizeof(float), g_stream_compute>>>(
+        d_expert_gate, (const unsigned char*)ge->d_gate, d_expert_input, hidden_dim, intermediate);
 
-    /* Up matmul on GPU */
-    q4k_matvec_kernel<<<intermediate, MATVEC_THREADS, hidden_dim * sizeof(float), g_stream_compute>>>(
-        d_expert_up, (const unsigned char*)ge->d_up, d_input_fp32, hidden_dim, intermediate);
+    /* Up matmul */
+    q4k_expert_kernel<<<intermediate, EXPERT_THREADS, hidden_dim * sizeof(float), g_stream_compute>>>(
+        d_expert_up, (const unsigned char*)ge->d_up, d_expert_input, hidden_dim, intermediate);
 
-    /* SwiGLU on GPU — no CPU round-trip! */
-    int swiglu_blocks = (intermediate + 255) / 256;
-    swiglu_kernel<<<swiglu_blocks, 256, 0, g_stream_compute>>>(
+    /* SwiGLU on GPU */
+    int swiglu_blocks = (intermediate + EXPERT_THREADS - 1) / EXPERT_THREADS;
+    swiglu_kernel<<<swiglu_blocks, EXPERT_THREADS, 0, g_stream_compute>>>(
         d_expert_act, d_expert_gate, d_expert_up, intermediate);
 
-    /* Down matmul on GPU */
-    q5k_matvec_kernel<<<hidden_dim, MATVEC_THREADS, intermediate * sizeof(float), g_stream_compute>>>(
-        d_output_fp32, (const unsigned char*)ge->d_down, d_expert_act, intermediate, hidden_dim);
+    /* Down matmul — expert-optimized Q5_K */
+    q5k_expert_kernel<<<hidden_dim, EXPERT_THREADS, intermediate * sizeof(float), g_stream_compute>>>(
+        d_expert_output, (const unsigned char*)ge->d_down, d_expert_act, intermediate, hidden_dim);
 
-    /* Download output ONCE */
-    CHECK_CUDA(cudaMemcpy(expert_out, d_output_fp32, hidden_dim * sizeof(float), cudaMemcpyDeviceToHost));
+    /* Download output — sync copy waits for all above */
+    CHECK_CUDA(cudaMemcpy(expert_out, d_expert_output, hidden_dim * sizeof(float), cudaMemcpyDeviceToHost));
+    return 0;
+}
+
+/* === Batched Expert API — single upload/download per layer === */
+
+/* Start a batched expert block: upload input once, zero moe_out on GPU */
+extern "C" int gpu_expert_batch_start(const float* normed, int hidden_dim) {
+    ensure_expert_buffers(hidden_dim);  /* reuse intermediate buffers */
+    ensure_expert_io(hidden_dim);
+    if (hidden_dim > d_moe_out_size) {
+        if (d_moe_out) cudaFree(d_moe_out);
+        cudaMalloc(&d_moe_out, hidden_dim * sizeof(float));
+        d_moe_out_size = hidden_dim;
+    }
+    /* Upload normed ONCE */
+    CHECK_CUDA(cudaMemcpy(d_expert_input, normed, hidden_dim * sizeof(float), cudaMemcpyHostToDevice));
+    /* Zero moe_out accumulator on GPU */
+    int zblocks = (hidden_dim + 255) / 256;
+    zero_kernel<<<zblocks, 256, 0, g_stream_compute>>>(d_moe_out, hidden_dim);
+    return 0;
+}
+
+/* Add one expert to the batch — all kernels queued on g_stream_compute, no sync */
+extern "C" int gpu_expert_batch_add(int cache_idx, int hidden_dim,
+    int intermediate, float weight)
+{
+    GPUExpert* ge = &g_gpu_experts[cache_idx];
+    ensure_expert_buffers(intermediate);
+
+    /* Gate matmul — input already on GPU from batch_start */
+    q4k_expert_kernel<<<intermediate, EXPERT_THREADS, hidden_dim * sizeof(float), g_stream_compute>>>(
+        d_expert_gate, (const unsigned char*)ge->d_gate, d_expert_input, hidden_dim, intermediate);
+
+    /* Up matmul */
+    q4k_expert_kernel<<<intermediate, EXPERT_THREADS, hidden_dim * sizeof(float), g_stream_compute>>>(
+        d_expert_up, (const unsigned char*)ge->d_up, d_expert_input, hidden_dim, intermediate);
+
+    /* SwiGLU on GPU */
+    int swiglu_blocks = (intermediate + EXPERT_THREADS - 1) / EXPERT_THREADS;
+    swiglu_kernel<<<swiglu_blocks, EXPERT_THREADS, 0, g_stream_compute>>>(
+        d_expert_act, d_expert_gate, d_expert_up, intermediate);
+
+    /* Down matmul */
+    q5k_expert_kernel<<<hidden_dim, EXPERT_THREADS, intermediate * sizeof(float), g_stream_compute>>>(
+        d_expert_output, (const unsigned char*)ge->d_down, d_expert_act, intermediate, hidden_dim);
+
+    /* Weighted accumulation on GPU — no download needed */
+    int ablocks = (hidden_dim + 255) / 256;
+    weighted_add_kernel<<<ablocks, 256, 0, g_stream_compute>>>(
+        d_moe_out, d_expert_output, weight, hidden_dim);
+
+    return 0;
+}
+
+/* Finish batch: download accumulated moe_out */
+extern "C" int gpu_expert_batch_finish(float* moe_out, int hidden_dim) {
+    CHECK_CUDA(cudaMemcpy(moe_out, d_moe_out, hidden_dim * sizeof(float), cudaMemcpyDeviceToHost));
     return 0;
 }
 
@@ -477,6 +692,7 @@ extern "C" int gpu_init(void) {
     CHECK_CUDA(cudaStreamCreateWithFlags(&g_stream_compute, cudaStreamNonBlocking));
     CHECK_CUDA(cudaStreamCreateWithFlags(&g_stream_h2d, cudaStreamNonBlocking));
     CHECK_CUDA(cudaStreamCreateWithFlags(&g_stream_d2h, cudaStreamNonBlocking));
+    CHECK_CUDA(cudaStreamCreateWithFlags(&g_stream_expert, cudaStreamNonBlocking));
 
     /* Allocate double-buffered pipeline slots */
     for (int s = 0; s < NUM_PIPELINE_SLOTS; s++) {
@@ -504,7 +720,7 @@ extern "C" int gpu_init(void) {
     g_initialized = 1;
     cudaDeviceProp prop;
     cudaGetDeviceProperties(&prop, 0);
-    fprintf(stderr, "GPU initialized: %s, %.0f MB VRAM, compute %d.%d, 3 streams\n",
+    fprintf(stderr, "GPU initialized: %s, %.0f MB VRAM, compute %d.%d, 4 streams\n",
             prop.name, prop.totalGlobalMem / (1024.0f * 1024.0f), prop.major, prop.minor);
     fflush(stderr);
     return 0;
@@ -675,6 +891,7 @@ extern "C" void gpu_shutdown(void) {
     if (g_stream_compute) cudaStreamDestroy(g_stream_compute);
     if (g_stream_h2d) cudaStreamDestroy(g_stream_h2d);
     if (g_stream_d2h) cudaStreamDestroy(g_stream_d2h);
+    if (g_stream_expert) cudaStreamDestroy(g_stream_expert);
     if (g_cublas) cublasDestroy(g_cublas);
     g_initialized = 0;
 }
