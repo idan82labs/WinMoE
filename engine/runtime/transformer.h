@@ -76,11 +76,12 @@ typedef struct {
     float* ssm_norm_w;     /* ssm_norm.weight [128] */
     float* ssm_conv1d_w;   /* ssm_conv1d.weight [4, 8192] */
 
-    /* Shared expert (always active alongside routed experts) */
+    /* Shared expert (sigmoid-gated, added to routed experts) */
     void* shexp_gate;   /* [hidden, intermediate] Q8_0 */
     void* shexp_up;     /* [hidden, intermediate] Q8_0 */
     void* shexp_down;   /* [intermediate, hidden] Q8_0 */
     int shexp_gate_type, shexp_up_type, shexp_down_type;
+    float* shexp_gate_inp; /* [hidden] FP32 — sigmoid gate for shared expert */
 
     /* Expert tensor info for loading */
     uint64_t gate_exps_offset;  /* offset in GGUF shard */

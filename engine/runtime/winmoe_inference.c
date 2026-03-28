@@ -385,6 +385,11 @@ static int load_shared_weights(const char* gguf_path, GGUFModel* model,
         t = find_tensor(model, name);
         if (t) { layers[l].shexp_down = load_tensor_data(model, t, &size); layers[l].shexp_down_type = t->type; }
 
+        /* Shared expert sigmoid gate weight [hidden] FP32 */
+        snprintf(name, 256, "blk.%d.ffn_gate_inp_shexp.weight", l);
+        t = find_tensor(model, name);
+        if (t) { layers[l].shexp_gate_inp = (float*)load_tensor_data(model, t, &size); }
+
         if (l % 10 == 0) { fprintf(stderr, "  Layer %d/%d loaded\n", l, model->num_layers); fflush(stderr); }
     }
 
@@ -673,6 +678,10 @@ int main(int argc, char** argv) {
         prof_attn_ms = prof_expert_io_ms = prof_expert_compute_ms = 0;
         prof_router_ms = prof_norm_ms = prof_embed_ms = 0;
 
+        /* DEBUG: dump raw Q8_0 embedding bytes for first token */
+        if (tok == 0) {
+            fprintf(stderr, "DEBUG: loading embedding for token %d\n", cur_token);
+        }
         /* 1. Get embedding for current token */
         if (embd_data) {
             /* Small model — embedding table already in RAM */
@@ -703,7 +712,28 @@ int main(int argc, char** argv) {
                 SetFilePointerEx(g_shard_handles[tok_embd->shard], eli, NULL, FILE_BEGIN);
                 DWORD ebr;
                 ReadFile(g_shard_handles[tok_embd->shard], embd_buf, embd_read_sz, &ebr, NULL);
-                q8_dequant_row(hidden, (char*)embd_buf + embd_sub, H);
+                const unsigned char* raw = (const unsigned char*)embd_buf + embd_sub;
+                if (tok == 0) {
+                    /* Dump first Q8_0 block: 2 bytes FP16 scale + 32 int8 values */
+                    fprintf(stderr, "  Q8_0 block0 hex: ");
+                    for (int bi = 0; bi < 34; bi++) fprintf(stderr, "%02x ", raw[bi]);
+                    fprintf(stderr, "\n");
+                    uint16_t d16; memcpy(&d16, raw, 2);
+                    float d_val = 0;
+                    /* FP16 to float */
+                    int sign = (d16 >> 15) & 1;
+                    int exp = (d16 >> 10) & 0x1F;
+                    int mant = d16 & 0x3FF;
+                    if (exp == 0) d_val = (sign ? -1.0f : 1.0f) * (mant / 1024.0f) * (1.0f / 16384.0f);
+                    else if (exp == 31) d_val = sign ? -INFINITY : INFINITY;
+                    else d_val = (sign ? -1.0f : 1.0f) * (1.0f + mant / 1024.0f) * powf(2.0f, exp - 15);
+                    fprintf(stderr, "  d16=0x%04x d_float=%.6f qs[0..3]=%d %d %d %d\n",
+                        d16, d_val, (int)(signed char)raw[2], (int)(signed char)raw[3],
+                        (int)(signed char)raw[4], (int)(signed char)raw[5]);
+                    fprintf(stderr, "  expected hidden[0]=%.6f (d*qs[0]=%.6f)\n",
+                        d_val * (float)(signed char)raw[2], d_val * (float)(signed char)raw[2]);
+                }
+                q8_dequant_row(hidden, raw, H);
                 _aligned_free(embd_buf);
             } else {
                 memset(hidden, 0, H * sizeof(float));
@@ -904,7 +934,7 @@ int main(int argc, char** argv) {
                         H
                     );
                 }
-            } else if (0 && lw->wq && lw->wk && lw->wv && lw->wo) { /* DEBUG: GQA disabled to isolate */
+            } else if (lw->wq && lw->wk && lw->wv && lw->wo) {
                 /* === STANDARD GQA ATTENTION (Qwen3.5: gated + QK norm + partial RoPE) === */
                 /* Standard attention: Q=[4096,16384], so 32 heads × 256 dim × 2 (gate) */
                 int nqh = 32;
@@ -1293,20 +1323,31 @@ int main(int argc, char** argv) {
                 quant_matvec(expert_out, lw->shexp_down, act_buf, H, I, lw->shexp_down_type);
 
                 /* Add shared expert output to moe_out (weight=1, always active) */
-                /* DEBUG: shared expert magnitude */
-                if (tok == 0 && layer <= 5) {
-                    float srms = 0; for (i = 0; i < H; i++) srms += expert_out[i]*expert_out[i];
-                    srms = sqrtf(srms / H);
-                    float grms2 = 0; for (i = 0; i < I; i++) grms2 += gate_buf[i]*gate_buf[i];
-                    grms2 = sqrtf(grms2 / I);
-                    float urms = 0; for (i = 0; i < I; i++) urms += up_buf[i]*up_buf[i];
-                    urms = sqrtf(urms / I);
-                    float arms2 = 0; for (i = 0; i < I; i++) arms2 += act_buf[i]*act_buf[i];
-                    arms2 = sqrtf(arms2 / I);
-                    fprintf(stderr, "  SHEXP L%d: gate=%.4f up=%.4f act=%.4f out=%.4f type=%d\n",
-                        layer, grms2, urms, arms2, srms, lw->shexp_gate_type);
+                /* Apply sigmoid gating to shared expert output */
+                if (lw->shexp_gate_inp) {
+                    /* Compute gate_scalar = dot(gate_weight, normed) */
+                    float gate_scalar = 0.0f;
+                    for (i = 0; i + 7 < H; i += 8) {
+                        __m256 vg = _mm256_loadu_ps(lw->shexp_gate_inp + i);
+                        __m256 vn = _mm256_loadu_ps(normed + i);
+                        __m256 vp = _mm256_mul_ps(vg, vn);
+                        /* Horizontal sum of 8 floats */
+                        __m128 hi4 = _mm256_extractf128_ps(vp, 1);
+                        __m128 lo4 = _mm256_castps256_ps128(vp);
+                        __m128 sum4 = _mm_add_ps(lo4, hi4);
+                        sum4 = _mm_hadd_ps(sum4, sum4);
+                        sum4 = _mm_hadd_ps(sum4, sum4);
+                        float partial; _mm_store_ss(&partial, sum4);
+                        gate_scalar += partial;
+                    }
+                    for (; i < H; i++) gate_scalar += lw->shexp_gate_inp[i] * normed[i];
+                    /* Apply sigmoid */
+                    float sig_gate = 1.0f / (1.0f + expf(-gate_scalar));
+                    /* Scale shared expert output */
+                    for (i = 0; i < H; i++) expert_out[i] *= sig_gate;
                 }
 
+                /* Add gated shared expert output to moe_out */
                 for (i = 0; i + 7 < H; i += 8) {
                     __m256 vm = _mm256_loadu_ps(moe_out + i);
                     __m256 ve = _mm256_loadu_ps(expert_out + i);
