@@ -27,24 +27,24 @@ static inline float q6k_dot_block(const block_q6_K* block, const float* y) {
     float d = fp16_to_fp32(block->d);
     float sum = 0.0f;
 
-    for (int group = 0; group < 16; group++) {
-        float sc = d * (float)block->scales[group];
-        int base = group * 16;
+    /* GGML Q6_K layout: 256 weights in 2 blocks of 128.
+     * Each 128-weight block has 4 groups of 32 weights.
+     * ql: 32 low nibbles per group, packed as [0..31][32..63] then high nibbles
+     * qh: 32 bytes, each holding 4×2-bit values for the 4 groups
+     * Scales: 16 int8 values, 2 per 128-block (8 per block, but interleaved) */
+    for (int n = 0; n < 256; n += 128) {
+        for (int l = 0; l < 32; l++) {
+            int is = n / 16;  /* scale base index */
+            /* 4 weights per (n, l) combination */
+            int q1 = (block->ql[l + 0  + n/2] & 0xF) | (((block->qh[l + n/4] >> 0) & 3) << 4);
+            int q2 = (block->ql[l + 32 + n/2] & 0xF) | (((block->qh[l + n/4] >> 2) & 3) << 4);
+            int q3 = (block->ql[l + 0  + n/2] >> 4)  | (((block->qh[l + n/4] >> 4) & 3) << 4);
+            int q4 = (block->ql[l + 32 + n/2] >> 4)  | (((block->qh[l + n/4] >> 6) & 3) << 4);
 
-        for (int j = 0; j < 16; j++) {
-            int idx = base + j;
-            /* Extract 6-bit value: 4 low bits from ql, 2 high bits from qh */
-            int ql_byte = idx / 2;
-            int ql_shift = (idx % 2) * 4;
-            int low4 = (block->ql[ql_byte] >> ql_shift) & 0x0F;
-
-            int qh_byte = idx / 4;
-            int qh_shift = (idx % 4) * 2;
-            int high2 = (block->qh[qh_byte] >> qh_shift) & 0x03;
-
-            int q6 = low4 | (high2 << 4);
-            float w = sc * (float)(q6 - 32);
-            sum += w * y[idx];
+            sum += d * (float)block->scales[is+0] * (float)(q1 - 32) * y[l + 0  + n];
+            sum += d * (float)block->scales[is+2] * (float)(q2 - 32) * y[l + 32 + n];
+            sum += d * (float)block->scales[is+4] * (float)(q3 - 32) * y[l + 64 + n];
+            sum += d * (float)block->scales[is+6] * (float)(q4 - 32) * y[l + 96 + n];
         }
     }
 

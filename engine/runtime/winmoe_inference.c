@@ -444,7 +444,7 @@ int main(int argc, char** argv) {
     cfg.intermediate = model.expert_intermediate;
     cfg.num_layers = model.num_layers;
     cfg.num_experts = model.num_experts;
-    cfg.expert_k = 4; /* Using K=4 for speed; model designed for K=10 */
+    cfg.expert_k = 10; /* Model designed for K=10 — correctness first */
     cfg.rope_theta = model.rope_theta > 0 ? model.rope_theta : 10000000.0f;
     cfg.max_seq_len = MAX_SEQ;
     cfg.num_kv_heads = model.head_count_kv > 0 ? model.head_count_kv : 2;
@@ -712,9 +712,9 @@ int main(int argc, char** argv) {
     LARGE_INTEGER prof_t0, prof_t1;
 
     /* Start with token ID 9707 ("Hello") — hardcoded for now */
-    /* Hardcoded prompt: <|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n */
-    int prompt_tokens[] = {151644, 872, 198, 9707, 151645, 198, 151644, 77091, 198};
-    int prompt_len = 9;
+    /* Prompt: <|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think>\n */
+    int prompt_tokens[] = {151644, 872, 198, 9707, 151645, 198, 151644, 77091, 198, 151667, 198};
+    int prompt_len = 11;
     int cur_token = prompt_tokens[0];
     int tokens_generated = 0;
 
@@ -1285,7 +1285,7 @@ int main(int argc, char** argv) {
                     gate_data = cached;
 
                     /* Try to promote to GPU cache */
-                    if (0 && use_gpu && gpu_expert_cache_count() < 50) { /* DEBUG: GPU expert cache disabled */
+                    if (use_gpu && gpu_expert_cache_count() < 50) {
                         gpu_cache_expert(layer, eid,
                             cached, (int)lw->gate_per_expert,
                             (char*)cached + lw->gate_per_expert, (int)lw->up_per_expert,
