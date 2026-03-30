@@ -1515,6 +1515,18 @@ int main(int argc, char** argv) {
             }
         }
 
+        /* Debug: pre-norm hidden state statistics */
+        if (tok == prompt_len) {
+            float hmin=1e30f, hmax=-1e30f, hsum=0, hsumsq=0;
+            for (int ii=0; ii<H; ii++) {
+                if (hidden[ii]<hmin) hmin=hidden[ii];
+                if (hidden[ii]>hmax) hmax=hidden[ii];
+                hsum+=hidden[ii]; hsumsq+=hidden[ii]*hidden[ii];
+            }
+            fprintf(stderr, "PRE-NORM hidden: min=%.4f max=%.4f mean=%.4f rms=%.4f\n",
+                hmin, hmax, hsum/H, sqrtf(hsumsq/H));
+        }
+
         /* 3. Final norm */
         if (final_norm) {
             rmsnorm(normed, hidden, final_norm, H);
@@ -1529,12 +1541,35 @@ int main(int argc, char** argv) {
                     tok, normed[0], normed[1], normed[2], normed[3], hmax);
         }
 
+        /* DEBUG: check Q6_K scale factor for LM head row 0 */
+        if (tok == prompt_len && lm_head && lm_head_type == 14) {
+            const unsigned char* lm_raw = (const unsigned char*)lm_head;
+            /* Q6_K block: ql[128] + qh[64] + scales[16] + d(2) */
+            /* d is at offset 128+64+16 = 208 */
+            uint16_t d16;
+            memcpy(&d16, lm_raw + 208, 2);
+            fprintf(stderr, "LM head Q6K block0: d16=0x%04x scales[0]=%d scales[1]=%d\n",
+                d16, (int)(signed char)lm_raw[192], (int)(signed char)lm_raw[193]);
+        }
+
         /* 4. LM head — project to vocab */
         if (lm_head) {
             quant_matvec(logits, lm_head, normed, vocab_size, H, lm_head_type);
         } else {
             /* LM head not loaded (too large) — use normed[0] as dummy logit */
             for (i = 0; i < vocab_size; i++) logits[i] = normed[i % H];
+        }
+
+        /* Debug: logit statistics */
+        if (tok == prompt_len) {
+            float lmin=1e30f, lmax=-1e30f, lsum=0, lsumsq=0;
+            for (int ii=0; ii<vocab_size; ii++) {
+                if (logits[ii]<lmin) lmin=logits[ii];
+                if (logits[ii]>lmax) lmax=logits[ii];
+                lsum+=logits[ii]; lsumsq+=logits[ii]*logits[ii];
+            }
+            fprintf(stderr, "LOGITS: min=%.4f max=%.4f mean=%.4f std=%.4f\n",
+                lmin, lmax, lsum/vocab_size, sqrtf(lsumsq/vocab_size - (lsum/vocab_size)*(lsum/vocab_size)));
         }
 
         /* Debug: top-10 logits + check for expected token */
