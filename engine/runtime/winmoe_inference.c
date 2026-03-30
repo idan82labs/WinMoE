@@ -848,7 +848,7 @@ int main(int argc, char** argv) {
                     if (tt) { lw->w_beta = load_tensor_data(&model, tt, &tsz); lw->w_beta_type = tt->type; }
                 }
 
-                if (use_gpu && lw->w_qkv && layer != 0) { /* DEBUG: L0 uses CPU path for comparison */
+                if (use_gpu && lw->w_qkv) {
                     /* === GPU DELTANET (Phase 3: async pipeline) === */
                     int slot_idx = layer % 2;
 
@@ -1179,7 +1179,7 @@ int main(int argc, char** argv) {
                     }
 
                     /* 8. O projection: [attn_dim → hidden_dim] — GPU if available */
-                    if (use_gpu && gpu_gqa_output(layer, attn_buf, attn_dim, o_out, H) != 0)
+                    if (!use_gpu || gpu_gqa_output(layer, attn_buf, attn_dim, o_out, H) != 0)
                         quant_matvec(o_out, lw->wo, attn_buf, H, attn_dim, lw->wo_type);
 
                     if (tok == 0 && layer == 3) {
