@@ -188,10 +188,12 @@ __global__ void q4k_matvec_kernel(float* output, const unsigned char* weights,
 
             for (int j = 0; j < 16; j++) {
                 unsigned char packed = qs[sub * 16 + j];
-                int idx = sub * 32 + j * 2;
+                /* GGML Q4_K: low nibble = weight[j], high nibble = weight[j+16] (BLOCKED, not interleaved) */
+                int idx0 = sub * 32 + j;       /* first 16 weights */
+                int idx1 = sub * 32 + j + 16;  /* second 16 weights */
                 float w0 = sc_f * (float)(packed & 0x0F) - mn_f;
                 float w1 = sc_f * (float)(packed >> 4) - mn_f;
-                block_sum += w0 * s_input[b * 256 + idx] + w1 * s_input[b * 256 + idx + 1];
+                block_sum += w0 * s_input[b * 256 + idx0] + w1 * s_input[b * 256 + idx1];
             }
         }
         partial += block_sum;
@@ -248,8 +250,9 @@ __global__ void q5k_matvec_kernel(float* output, const unsigned char* weights,
 
             for (int j = 0; j < 16; j++) {
                 unsigned char packed = qs[sub * 16 + j];
-                int idx0 = sub * 32 + j * 2;
-                int idx1 = idx0 + 1;
+                /* GGML Q5_K: low nibble = weight[j], high nibble = weight[j+16] (BLOCKED) */
+                int idx0 = sub * 32 + j;       /* first 16 weights */
+                int idx1 = sub * 32 + j + 16;  /* second 16 weights */
                 int q0 = (packed & 0x0F) | (((qh[idx0 / 8] >> (idx0 % 8)) & 1) << 4);
                 int q1 = (packed >> 4) | (((qh[idx1 / 8] >> (idx1 % 8)) & 1) << 4);
                 float w0 = sc_f * (float)q0 - mn_f;
@@ -327,7 +330,7 @@ __global__ void q4k_expert_kernel(float* output, const unsigned char* weights,
             unsigned char packed = __ldg(qp + j);
             float w0 = sc_f * (float)(packed & 0x0F) - mn_f;
             float w1 = sc_f * (float)(packed >> 4) - mn_f;
-            sub_sum += w0 * s_input[base_idx + j * 2] + w1 * s_input[base_idx + j * 2 + 1];
+            sub_sum += w0 * s_input[base_idx + j] + w1 * s_input[base_idx + j + 16];
         }
         partial += sub_sum;
     }
@@ -381,12 +384,13 @@ __global__ void q5k_expert_kernel(float* output, const unsigned char* weights,
         #pragma unroll
         for (int j = 0; j < 16; j++) {
             unsigned char packed = __ldg(qp + j);
-            int idx0 = sub * 32 + j * 2;
-            int q0 = (packed & 0x0F) | (((qh[idx0 / 8] >> (idx0 % 8)) & 1) << 4);
-            int q1 = (packed >> 4) | (((qh[(idx0+1) / 8] >> ((idx0+1) % 8)) & 1) << 4);
+            int wi0 = sub * 32 + j;       /* first 16 weights (blocked) */
+            int wi1 = sub * 32 + j + 16; /* second 16 weights */
+            int q0 = (packed & 0x0F) | (((qh[wi0 / 8] >> (wi0 % 8)) & 1) << 4);
+            int q1 = (packed >> 4) | (((qh[wi1 / 8] >> (wi1 % 8)) & 1) << 4);
             float w0 = sc_f * (float)q0 - mn_f;
             float w1 = sc_f * (float)q1 - mn_f;
-            sub_sum += w0 * s_input[base_idx + j * 2] + w1 * s_input[base_idx + j * 2 + 1];
+            sub_sum += w0 * s_input[base_idx + j] + w1 * s_input[base_idx + j + 16];
         }
         partial += sub_sum;
     }
