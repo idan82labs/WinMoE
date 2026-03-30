@@ -250,11 +250,12 @@ __global__ void q5k_matvec_kernel(float* output, const unsigned char* weights,
 
             for (int j = 0; j < 16; j++) {
                 unsigned char packed = qs[sub * 16 + j];
-                /* GGML Q5_K: low nibble = weight[j], high nibble = weight[j+16] (BLOCKED) */
+                /* GGML Q5_K: low nibble = weight[j], high nibble = weight[j+16] (BLOCKED)
+                 * High bit: qh[weight_j] >> sub, NOT qh[idx/8] >> (idx%8) */
                 int idx0 = sub * 32 + j;       /* first 16 weights */
                 int idx1 = sub * 32 + j + 16;  /* second 16 weights */
-                int q0 = (packed & 0x0F) | (((qh[idx0 / 8] >> (idx0 % 8)) & 1) << 4);
-                int q1 = (packed >> 4) | (((qh[idx1 / 8] >> (idx1 % 8)) & 1) << 4);
+                int q0 = (packed & 0x0F) | (((qh[j] >> sub) & 1) << 4);
+                int q1 = (packed >> 4) | (((qh[j + 16] >> sub) & 1) << 4);
                 float w0 = sc_f * (float)q0 - mn_f;
                 float w1 = sc_f * (float)q1 - mn_f;
                 block_sum += w0 * s_input[b * 256 + idx0] + w1 * s_input[b * 256 + idx1];
@@ -386,8 +387,9 @@ __global__ void q5k_expert_kernel(float* output, const unsigned char* weights,
             unsigned char packed = __ldg(qp + j);
             int wi0 = sub * 32 + j;       /* first 16 weights (blocked) */
             int wi1 = sub * 32 + j + 16; /* second 16 weights */
-            int q0 = (packed & 0x0F) | (((qh[wi0 / 8] >> (wi0 % 8)) & 1) << 4);
-            int q1 = (packed >> 4) | (((qh[wi1 / 8] >> (wi1 % 8)) & 1) << 4);
+            /* Q5_K high bit: qh[j] >> sub, NOT qh[idx/8] >> (idx%8) */
+            int q0 = (packed & 0x0F) | (((qh[j] >> sub) & 1) << 4);
+            int q1 = (packed >> 4) | (((qh[j + 16] >> sub) & 1) << 4);
             float w0 = sc_f * (float)q0 - mn_f;
             float w1 = sc_f * (float)q1 - mn_f;
             sub_sum += w0 * s_input[base_idx + j] + w1 * s_input[base_idx + j + 16];

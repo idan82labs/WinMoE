@@ -2359,3 +2359,44 @@ The shared expert output must be gated by `sigmoid(dot(ffn_gate_inp_shexp, input
 **Reference validation**: llama.cpp (b8565) confirmed working — produces coherent output `[Start thinking] Thinking Process: 1. **Analyze` at 0.2 tok/s CPU-only. Our engine produces varied but incoherent tokens (`carga Salir compuls lin performed`), indicating remaining computation errors likely in the DeltaNet linear attention recurrence.
 
 **68 experiments logged in results.tsv.**
+
+### 22.6 Systematic Bug Hunt — 10 Bugs Found (v10.7-v10.14)
+
+After establishing that the model produced gibberish despite having all major components implemented, a systematic debugging campaign was conducted using ML expert audit agents and layer-by-layer validation against llama.cpp.
+
+**Bug #4: DeltaNet QKV dimensions (v10.7)**
+QKV tensor is [4096, 12288] = Q(2048) + K(2048) + V(8192). Previously assumed [4096, 16384]. The model has 64 value heads, 16 key heads, head_dim=128 — asymmetric heads requiring correct split.
+
+**Bug #5: DeltaNet head assignment (v10.7)**
+V is per-value-head (64 heads), Q readout uses key group index (16 groups). Previously V was indexed per-group like K.
+
+**Bug #6: Missing conv1d (v10.8)**
+`ssm_conv1d.weight` [4, 12288] was in the GGUF but never loaded or used. The causal conv1d with SiLU activation is critical for mixing short-range context into QKV.
+
+**Bug #7: DeltaNet decay formula (v10.9)**
+GGUF stores A_log directly (negative value). llama.cpp uses `exp(A_log * softplus(...))`. Our code incorrectly used `exp(-exp(A_log) * softplus(...))` — producing 82% retention instead of correct 5%.
+
+**Bug #8: Conv1d weight layout (v10.10)**
+GGUF stores conv1d as [channels=12288, kernel=4] but we read as [kernel, channels]. Also the kernel needed reversal (k=3 = current token).
+
+**Bug #9: GPU Q4_K/Q5_K nibble addressing (v10.12)**
+Found by MoE audit agent. GGML Q4_K uses BLOCKED layout (low nibble = weight[j], high nibble = weight[j+16]) but GPU kernels used INTERLEAVED (j*2, j*2+1). Every GPU expert computation scrambled weights against wrong activation positions. Fixed in all 5 GPU kernel locations.
+
+**Bug #10: Q6_K LM head dequant layout (v10.14)**
+The critical breakthrough. GGML Q6_K uses a complex BLOCKED layout with 256 weights in 2 blocks of 128, each with 4 groups of 32. Our code treated ql/qh as sequential pairs. EVERY SINGLE LOGIT was computed from scrambled weight data. Fix changed output from random Chinese characters to English-adjacent tokens.
+
+**Validation infrastructure built:**
+- llama.cpp (b8565) built from source with debug prints in `ggml_ssm_conv`
+- Reference conv1d output obtained: [-0.005826, -0.011908, 0.286961, ...]
+- Raw QKV weight bytes hex-verified against GGUF file at exact byte offset
+- L0 embedding, RMSNorm, QKV matmul all confirmed correct vs reference
+- 4 parallel ML audit agents deployed covering DeltaNet, GQA, MoE, and residual flow
+
+**Current state (v10.14):**
+- Token `<think>` (151667) logit = +0.30 (positive, correct direction)
+- Top-1 token is `ext` (427) at logit 8.72 (English, not Chinese)
+- Model produces English-adjacent tokens but not yet coherent text
+- All 4 ML auditors found NO remaining bugs in the core algorithms
+- The DeltaNet state recurrence matches llama.cpp reference exactly
+
+**70 experiments logged.**
