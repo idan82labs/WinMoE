@@ -595,7 +595,14 @@ int main(int argc, char** argv) {
                 if (!layers[i].w_qkv) {
                     snprintf(tname, 256, "blk.%d.attn_qkv.weight", i);
                     TensorInfo* tt = find_tensor(&model, tname);
-                    if (tt) { layers[i].w_qkv = load_tensor_data(&model, tt, &tsz); layers[i].w_qkv_type = tt->type; }
+                    if (tt) {
+                        if (i == 0) fprintf(stderr, "  L0 QKV LOAD: shard=%d offset=%llu data_start=%llu abs=%llu datasize=%llu\n",
+                            tt->shard, (unsigned long long)tt->offset,
+                            (unsigned long long)model.shard_data_starts[tt->shard],
+                            (unsigned long long)(model.shard_data_starts[tt->shard] + tt->offset),
+                            (unsigned long long)tt->data_size);
+                        layers[i].w_qkv = load_tensor_data(&model, tt, &tsz); layers[i].w_qkv_type = tt->type;
+                    }
                 }
                 if (!layers[i].w_attn_gate) {
                     snprintf(tname, 256, "blk.%d.attn_gate.weight", i);
@@ -812,7 +819,13 @@ int main(int argc, char** argv) {
                 if (!lw->w_qkv) {
                     snprintf(tname, 256, "blk.%d.attn_qkv.weight", layer);
                     TensorInfo* tt = find_tensor(&model, tname);
-                    if (tt) { lw->w_qkv = load_tensor_data(&model, tt, &tsz); lw->w_qkv_type = tt->type; }
+                    if (tt) {
+                        if (layer == 0) fprintf(stderr, "  L0 QKV: shard=%d offset=%llu data_start=%llu abs=%llu\n",
+                            tt->shard, (unsigned long long)tt->offset,
+                            (unsigned long long)model.shard_data_starts[tt->shard],
+                            (unsigned long long)(model.shard_data_starts[tt->shard] + tt->offset));
+                        lw->w_qkv = load_tensor_data(&model, tt, &tsz); lw->w_qkv_type = tt->type;
+                    }
                 }
                 if (!lw->w_attn_gate) {
                     snprintf(tname, 256, "blk.%d.attn_gate.weight", layer);
@@ -835,7 +848,7 @@ int main(int argc, char** argv) {
                     if (tt) { lw->w_beta = load_tensor_data(&model, tt, &tsz); lw->w_beta_type = tt->type; }
                 }
 
-                if (use_gpu && lw->w_qkv) {
+                if (use_gpu && lw->w_qkv && layer != 0) { /* DEBUG: L0 uses CPU path for comparison */
                     /* === GPU DELTANET (Phase 3: async pipeline) === */
                     int slot_idx = layer % 2;
 
@@ -1011,6 +1024,18 @@ int main(int argc, char** argv) {
                         if (zv > 88.0f) zv = 88.0f;
                         if (zv < -88.0f) zv = -88.0f;
                         gated_out[hi] = normed_out[hi] * (zv / (1.0f + expf(-zv)));
+                    }
+
+                    if (tok == 0 && layer == 0) {
+                        float hr = 0; for (i = 0; i < DN_INNER; i++) hr += head_output[i]*head_output[i];
+                        float nr = 0; for (i = 0; i < DN_INNER; i++) nr += normed_out[i]*normed_out[i];
+                        float gr = 0; for (i = 0; i < DN_INNER; i++) gr += gated_out[i]*gated_out[i];
+                        fprintf(stderr, "  head_output rms=%.6f normed rms=%.6f gated rms=%.6f\n",
+                            sqrtf(hr/DN_INNER), sqrtf(nr/DN_INNER), sqrtf(gr/DN_INNER));
+                        fprintf(stderr, "  head_out[0..3]: %.6f %.6f %.6f %.6f\n",
+                            head_output[0], head_output[1], head_output[2], head_output[3]);
+                        fprintf(stderr, "  gated[0..3]: %.6f %.6f %.6f %.6f\n",
+                            gated_out[0], gated_out[1], gated_out[2], gated_out[3]);
                     }
 
                     /* ASYNC: Launch SSM Out on GPU */

@@ -142,6 +142,24 @@ static void deltanet_forward(
     float* alpha_raw = state->tmp_alpha;
     float* beta_raw = state->tmp_beta;
 
+    /* DEBUG: dump first Q8_0 block of QKV weight */
+    {
+        static int qkv_dump = 0;
+        if (qkv_dump == 0 && w_qkv) {
+            const unsigned char* raw = (const unsigned char*)w_qkv;
+            fprintf(stderr, "QKV weight block0 hex: ");
+            for (int bi = 0; bi < 34; bi++) fprintf(stderr, "%02x ", raw[bi]);
+            fprintf(stderr, "\n");
+            /* Also dequant and print first few weight values */
+            uint16_t d16; memcpy(&d16, raw, 2);
+            fprintf(stderr, "QKV w_row0 d16=0x%04x qs[0..7]=%d %d %d %d %d %d %d %d\n",
+                d16, (int)(signed char)raw[2], (int)(signed char)raw[3],
+                (int)(signed char)raw[4], (int)(signed char)raw[5],
+                (int)(signed char)raw[6], (int)(signed char)raw[7],
+                (int)(signed char)raw[8], (int)(signed char)raw[9]);
+            qkv_dump++;
+        }
+    }
     quant_matvec(qkv, w_qkv, x, DN_QKV_DIM, hidden_dim, w_qkv_type);
     quant_matvec(z, w_gate, x, DN_GATE_DIM, hidden_dim, w_gate_type);
 
@@ -150,6 +168,22 @@ static void deltanet_forward(
 
     if (w_beta) quant_matvec(beta_raw, w_beta, x, DN_NUM_GATES, hidden_dim, w_beta_type);
     else memset(beta_raw, 0, DN_NUM_GATES * sizeof(float));
+
+    /* DEBUG: print RMS + normed values for verification */
+    {
+        static int cpu_dn_call = 0;
+        if (cpu_dn_call == 0) {
+            /* What input x does the matmul see? x is the normed hidden state */
+            double sum_sq = 0;
+            for (i = 0; i < hidden_dim; i++) sum_sq += (double)x[i] * x[i];
+            float x_rms = sqrtf((float)(sum_sq / hidden_dim));
+            fprintf(stderr, "CPU L0: input_x[0..3]=%.6f %.6f %.6f %.6f x_rms=%.6f\n",
+                x[0], x[1], x[2], x[3], x_rms);
+            fprintf(stderr, "CPU L0: QKV pre-conv[0..7]: %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f\n",
+                qkv[0], qkv[1], qkv[2], qkv[3], qkv[4], qkv[5], qkv[6], qkv[7]);
+            cpu_dn_call++;
+        }
+    }
 
     /* 1b. Conv1d: depthwise causal convolution on QKV [kernel=4, channels=12288]
      * For autoregressive: sliding window of last 4 QKV vectors.
