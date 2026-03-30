@@ -75,7 +75,7 @@ static void dn_l2norm(float* x, int n) {
     float ss = 0.0f;
     int i;
     for (i = 0; i < n; i++) ss += x[i] * x[i];
-    float inv = 1.0f / (sqrtf(ss) + 1e-12f);
+    float inv = 1.0f / (sqrtf(ss) + 1e-6f); /* match llama.cpp's eps */
     for (i = 0; i < n; i++) x[i] *= inv;
 }
 

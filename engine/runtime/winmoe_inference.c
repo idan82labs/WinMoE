@@ -1285,7 +1285,7 @@ int main(int argc, char** argv) {
                     gate_data = cached;
 
                     /* Try to promote to GPU cache */
-                    if (use_gpu && gpu_expert_cache_count() < 50) { /* limit: reduced — GQA weights take 1.6GB VRAM */
+                    if (0 && use_gpu && gpu_expert_cache_count() < 50) { /* DEBUG: GPU expert cache disabled */
                         gpu_cache_expert(layer, eid,
                             cached, (int)lw->gate_per_expert,
                             (char*)cached + lw->gate_per_expert, (int)lw->up_per_expert,
@@ -1559,7 +1559,8 @@ int main(int argc, char** argv) {
                 fprintf(stderr, "  #%d: id=%d logit=%.4f\n", i+1, top_ids[i], top_vals[i]);
             /* Check where expected token ranks */
             fprintf(stderr, "  Token 151644 (<|im_start|>) logit=%.4f\n", logits[151644]);
-            fprintf(stderr, "  Token 151646 (<|think|>?) logit=%.4f\n", logits[151646]);
+            fprintf(stderr, "  Token 151667 (<think>) logit=%.4f\n", logits[151667]);
+            fprintf(stderr, "  Token 151668 (</think>) logit=%.4f\n", logits[151668]);
             int nan_count = 0;
             for (i = 0; i < vocab_size; i++) if (logits[i] != logits[i]) nan_count++;
             if (nan_count > 0) fprintf(stderr, "WARNING: %d NaN logits!\n", nan_count);
