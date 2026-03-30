@@ -81,19 +81,19 @@ static void dn_l2norm(float* x, int n) {
 
 /* RMS norm (no learned weight version) */
 static void dn_rmsnorm_simple(float* out, const float* x, int n) {
-    float ss = 0.0f;
+    double ss = 0.0;
     int i;
-    for (i = 0; i < n; i++) ss += x[i] * x[i];
-    float inv = 1.0f / sqrtf(ss / n + 1e-6f);
+    for (i = 0; i < n; i++) ss += (double)x[i] * (double)x[i];
+    float inv = 1.0f / sqrtf((float)(ss / n) + 1e-6f);
     for (i = 0; i < n; i++) out[i] = x[i] * inv;
 }
 
 /* RMS norm with learned weight */
 static void dn_rmsnorm_weighted(float* out, const float* x, const float* w, int n) {
-    float ss = 0.0f;
+    double ss = 0.0;
     int i;
-    for (i = 0; i < n; i++) ss += x[i] * x[i];
-    float inv = 1.0f / sqrtf(ss / n + 1e-6f);
+    for (i = 0; i < n; i++) ss += (double)x[i] * (double)x[i];
+    float inv = 1.0f / sqrtf((float)(ss / n) + 1e-6f);
     for (i = 0; i < n; i++) out[i] = x[i] * inv * w[i];
 }
 

@@ -28,24 +28,13 @@
 /* RMSNorm: y = x * w / sqrt(mean(x^2) + eps) — AVX2 vectorized */
 static void rmsnorm(float* out, const float* x, const float* w, int dim) {
     int i;
-    /* Pass 1: sum of squares */
-    __m256 vss = _mm256_setzero_ps();
-    for (i = 0; i + 7 < dim; i += 8) {
-        __m256 vx = _mm256_loadu_ps(x + i);
-        vss = _mm256_fmadd_ps(vx, vx, vss);
-    }
-    __m128 hi = _mm256_extractf128_ps(vss, 1);
-    __m128 lo = _mm256_castps256_ps128(vss);
-    __m128 s4 = _mm_add_ps(lo, hi);
-    s4 = _mm_hadd_ps(s4, s4);
-    s4 = _mm_hadd_ps(s4, s4);
-    float ss;
-    _mm_store_ss(&ss, s4);
-    for (; i < dim; i++) ss += x[i] * x[i];
-    ss = 1.0f / sqrtf(ss / dim + 1e-6f);
+    /* Pass 1: sum of squares (double precision to match llama.cpp) */
+    double ss = 0.0;
+    for (i = 0; i < dim; i++) ss += (double)x[i] * (double)x[i];
+    float scale = 1.0f / sqrtf((float)(ss / dim) + 1e-6f);
 
     /* Pass 2: scale and multiply by weight */
-    __m256 vscale = _mm256_set1_ps(ss);
+    __m256 vscale = _mm256_set1_ps(scale);
     for (i = 0; i + 7 < dim; i += 8) {
         __m256 vx = _mm256_loadu_ps(x + i);
         __m256 vw = _mm256_loadu_ps(w + i);
