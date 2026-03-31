@@ -1011,6 +1011,20 @@ int main(int argc, char** argv) {
 
                     /* RMS norm + SiLU gating */
                     float* normed_out = dn_states[layer].tmp_normed;
+                    /* T9 DEBUG: state matrix stats at midpoint */
+                    if ((tok == 0 || tok == prompt_len - 1) && layer == 0) {
+                        float* S0 = dn_states[layer].S;
+                        double srms = 0; float smax = 0;
+                        for (int si = 0; si < DN_HEAD_DIM * DN_HEAD_DIM; si++) {
+                            srms += (double)S0[si] * S0[si];
+                            if (fabsf(S0[si]) > smax) smax = fabsf(S0[si]);
+                        }
+                        fprintf(stderr, "  STATE L%d head0: rms=%.6f max=%.6f\n",
+                            layer, sqrtf((float)(srms / (DN_HEAD_DIM * DN_HEAD_DIM))), smax);
+                        fprintf(stderr, "  head_out rms=%.6f normed rms=%.6f gated rms=%.6f\n",
+                            sqrtf(head_output[0]*head_output[0]), 0.0f, 0.0f);
+                    }
+
                     float* gated_out = dn_states[layer].tmp_gated;
                     for (hi = 0; hi < DN_NUM_Q_HEADS; hi++) {
                         if (lw->ssm_norm_w)
