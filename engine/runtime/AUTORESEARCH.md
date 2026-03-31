@@ -37,8 +37,23 @@ Currently: "VverVVV.VAVV..." (single chars). Target: actual sentences.
 - Output: "_DESTROY_clientext.row.Cancel"
 - <think> logit: -0.02 (almost zero!)
 
-## Next Hypotheses to Try
-1. The GPU Q8_0 kernel shared memory accumulation may lose precision vs CPU
-2. Double-precision state recurrence (use scalar double instead of AVX float)
-3. The DeltaNet output scale 1/sqrt(128) may need to match llama.cpp exactly
-4. Check if we need to add dt_bias to the alpha BEFORE softplus in conv1d context
+| T11 | CPU-only with ALL fixes | "\nni!pc a日stage" same as T6 | reject — GPU actually better |
+
+## Key Findings from Web Research
+1. GGUF converter transforms A_log → -exp(A_log) before storing (line 7633 of convert_hf_to_gguf.py)
+2. Our decay formula exp(ssm_a * softplus(...)) IS correct — ssm_a is already -exp(A_log)
+3. flash-linear-attention confirms: state *= exp(g), not state *= g (raw)
+4. HuggingFace ref: g = -A_log.exp() * softplus(a + dt_bias), then state *= exp(g)
+5. llama.cpp: gate = ssm_a * softplus(...), then state *= exp(gate) — SAME formula
+6. Token 198 (\n) has logit 3.17 in ours vs 15.14 in llama.cpp — 12 point gap
+
+## Remaining Gap Analysis
+- Our logits for meaningful tokens (\n, Here) are 10-12 points BELOW llama.cpp
+- Our logits for single-char tokens (V, A, ver) are SIMILAR to llama.cpp's
+- The model correctly downranks garbage but fails to uprank correct tokens
+- This is a SIGNAL problem, not a NOISE problem
+
+## Next Hypotheses
+1. The DeltaNet state readout scale may be wrong (1/sqrt(128) applied where?)
+2. The GQA attention may not properly route context from full attention layers to the DeltaNet state
+3. There may be a missing bias or scale in the SSM Out projection

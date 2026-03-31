@@ -444,7 +444,8 @@ int main(int argc, char** argv) {
     cfg.intermediate = model.expert_intermediate;
     cfg.num_layers = model.num_layers;
     cfg.num_experts = model.num_experts;
-    cfg.expert_k = 10; /* Model designed for K=10 */
+    cfg.expert_k = model.expert_used_count > 0 ? model.expert_used_count : 10;
+    fprintf(stderr, "GGUF expert_used_count=%d\n", model.expert_used_count);
     cfg.rope_theta = model.rope_theta > 0 ? model.rope_theta : 10000000.0f;
     cfg.max_seq_len = MAX_SEQ;
     cfg.num_kv_heads = model.head_count_kv > 0 ? model.head_count_kv : 2;
@@ -1575,6 +1576,8 @@ int main(int argc, char** argv) {
             fprintf(stderr, "  Token 151644 (<|im_start|>) logit=%.4f\n", logits[151644]);
             fprintf(stderr, "  Token 151667 (<think>) logit=%.4f\n", logits[151667]);
             fprintf(stderr, "  Token 151668 (</think>) logit=%.4f\n", logits[151668]);
+            fprintf(stderr, "  Token 198 (\\n) logit=%.4f  Token 8420 (Here) logit=%.4f\n",
+                logits[198], logits[8420]);
             int nan_count = 0;
             for (i = 0; i < vocab_size; i++) if (logits[i] != logits[i]) nan_count++;
             if (nan_count > 0) fprintf(stderr, "WARNING: %d NaN logits!\n", nan_count);
