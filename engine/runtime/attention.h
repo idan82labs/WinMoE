@@ -150,10 +150,10 @@ static void gqa_attention(
         int t;
         for (t = 0; t < seq_len; t++) {
             const float* kt = kv->keys + t * num_kv_heads * head_dim + kv_head * head_dim;
-            float dot = 0.0f;
+            double dot = 0.0;
             int d;
-            for (d = 0; d < head_dim; d++) dot += qh[d] * kt[d];
-            scores[t] = dot * scale;
+            for (d = 0; d < head_dim; d++) dot += (double)qh[d] * (double)kt[d];
+            scores[t] = (float)(dot * scale);
         }
 
         /* Softmax */

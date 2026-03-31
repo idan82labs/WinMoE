@@ -712,9 +712,9 @@ int main(int argc, char** argv) {
     LARGE_INTEGER prof_t0, prof_t1;
 
     /* Start with token ID 9707 ("Hello") — hardcoded for now */
-    /* Prompt: <|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think>\n */
-    int prompt_tokens[] = {151644, 872, 198, 9707, 151645, 198, 151644, 77091, 198, 151667, 198};
-    int prompt_len = 11;
+    /* Prompt: <|im_start|>user\nExplain quantum physics simply<|im_end|>\n<|im_start|>assistant\n<think>\n */
+    int prompt_tokens[] = {151644, 872, 198, 840, 20772, 30128, 21321, 4936, 151645, 198, 151644, 77091, 198, 151667, 198};
+    int prompt_len = 15;
     int cur_token = prompt_tokens[0];
     int tokens_generated = 0;
 
@@ -1455,22 +1455,9 @@ int main(int argc, char** argv) {
                 /* Add shared expert output to moe_out (weight=1, always active) */
                 /* Apply sigmoid gating to shared expert output */
                 if (lw->shexp_gate_inp) {
-                    /* Compute gate_scalar = dot(gate_weight, normed) */
-                    float gate_scalar = 0.0f;
-                    for (i = 0; i + 7 < H; i += 8) {
-                        __m256 vg = _mm256_loadu_ps(lw->shexp_gate_inp + i);
-                        __m256 vn = _mm256_loadu_ps(normed + i);
-                        __m256 vp = _mm256_mul_ps(vg, vn);
-                        /* Horizontal sum of 8 floats */
-                        __m128 hi4 = _mm256_extractf128_ps(vp, 1);
-                        __m128 lo4 = _mm256_castps256_ps128(vp);
-                        __m128 sum4 = _mm_add_ps(lo4, hi4);
-                        sum4 = _mm_hadd_ps(sum4, sum4);
-                        sum4 = _mm_hadd_ps(sum4, sum4);
-                        float partial; _mm_store_ss(&partial, sum4);
-                        gate_scalar += partial;
-                    }
-                    for (; i < H; i++) gate_scalar += lw->shexp_gate_inp[i] * normed[i];
+                    /* Compute gate_scalar = dot(gate_weight, normed) — double precision */
+                    double gate_scalar = 0.0;
+                    for (i = 0; i < H; i++) gate_scalar += (double)lw->shexp_gate_inp[i] * (double)normed[i];
                     /* Apply sigmoid */
                     float sig_gate = 1.0f / (1.0f + expf(-gate_scalar));
                     /* Scale shared expert output */

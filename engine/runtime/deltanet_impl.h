@@ -72,10 +72,10 @@ static void dn_state_free(DeltaNetState* s) {
 
 /* L2 normalize in-place */
 static void dn_l2norm(float* x, int n) {
-    float ss = 0.0f;
+    double ss = 0.0;
     int i;
-    for (i = 0; i < n; i++) ss += x[i] * x[i];
-    float inv = 1.0f / (sqrtf(ss) + 1e-6f); /* match llama.cpp's eps */
+    for (i = 0; i < n; i++) ss += (double)x[i] * (double)x[i];
+    float inv = 1.0f / (sqrtf((float)ss) + 1e-6f);
     for (i = 0; i < n; i++) x[i] *= inv;
 }
 
