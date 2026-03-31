@@ -713,9 +713,9 @@ int main(int argc, char** argv) {
     LARGE_INTEGER prof_t0, prof_t1;
 
     /* Start with token ID 9707 ("Hello") — hardcoded for now */
-    /* Prompt: <|im_start|>user\nExplain quantum physics simply<|im_end|>\n<|im_start|>assistant\n<think>\n */
-    int prompt_tokens[] = {151644, 872, 198, 840, 20772, 30128, 21321, 4936, 151645, 198, 151644, 77091, 198, 151667, 198};
-    int prompt_len = 15;
+    /* Prompt: <|im_start|>user\nExplain quantum physics simply<|im_end|>\n<|im_start|>assistant\n<think>\n\nThe */
+    int prompt_tokens[] = {151644, 872, 198, 840, 20772, 30128, 21321, 4936, 151645, 198, 151644, 77091, 198, 151667, 198, 198, 785};
+    int prompt_len = 17;
     int cur_token = prompt_tokens[0];
     int tokens_generated = 0;
 

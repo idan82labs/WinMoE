@@ -53,7 +53,26 @@ Currently: "VverVVV.VAVV..." (single chars). Target: actual sentences.
 - The model correctly downranks garbage but fails to uprank correct tokens
 - This is a SIGNAL problem, not a NOISE problem
 
-## Next Hypotheses
-1. The DeltaNet state readout scale may be wrong (1/sqrt(128) applied where?)
-2. The GQA attention may not properly route context from full attention layers to the DeltaNet state
-3. There may be a missing bias or scale in the SSM Out projection
+| T12 | Reversed conv1d (ggml matching) | ".A.AVV.." single chars worse | reject — unreversed still better |
+| T13 | Seed "The" after <think>\n\n | ".V.V.V.VVV." single chars | reject — seeding doesn't help |
+
+## Verified Against 4 Sources
+All 5 DeltaNet recurrence steps verified identical:
+1. HuggingFace modeling_qwen3_5.py
+2. flash-linear-attention naive.py
+3. llama.cpp delta-net-base.cpp
+4. GGUF converter: A_log → -exp(A_log)
+
+## Conv1d Direction Paradox
+- ggml_ssm_conv: w[3]*newest + w[0]*oldest
+- Our unreversed (T3 best): w[0]*newest + w[3]*oldest
+- Our reversed (T12): w[3]*newest = matches ggml BUT gives worse output
+- Conclusion: our buffer ordering flipped relative to ggml, so unreversed compensates
+
+## STATUS: All algorithms correct, 12-point logit gap remains
+The issue is NOT in the algorithm — it's in how information accumulates across
+60 layers and 15 tokens. Could be subtle precision interaction, OpenMP thread
+ordering, or a minor numerical detail in the Q8_0 matmul accumulation.
+
+## Option B ready if needed
+Fall back to using llama.cpp for DeltaNet computation, our engine for MoE speed.
