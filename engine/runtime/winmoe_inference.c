@@ -898,7 +898,7 @@ int main(int argc, char** argv) {
                             for (int k = 0; k < DN_CONV_WIDTH; k++) {
                                 int hs = ((ds->conv_pos - 1 - k) % DN_CONV_WIDTH + DN_CONV_WIDTH) % DN_CONV_WIDTH;
                                 /* Kernel reversed: k=0 maps to oldest, kernel_size-1-k maps to newest */
-                                sum += lw->ssm_conv1d_w[i * DN_CONV_WIDTH + (DN_CONV_WIDTH - 1 - k)] * ds->conv_buf[hs * DN_QKV_DIM + i];
+                                sum += lw->ssm_conv1d_w[i * DN_CONV_WIDTH + k] * ds->conv_buf[hs * DN_QKV_DIM + i];
                             }
                             float sig = 1.0f / (1.0f + expf(-sum));
                             gpu_qkv[i] = sum * sig; /* SiLU */
@@ -1380,23 +1380,10 @@ int main(int argc, char** argv) {
                     quant_matvec(up_buf, up_data, normed, I, H, lw->up_exps_type);
                 }
 
-                /* SwiGLU: act = silu(gate) * up — AVX2 fast sigmoid */
-                for (i = 0; i + 7 < I; i += 8) {
-                    __m256 vg = _mm256_loadu_ps(gate_buf + i);
-                    __m256 vu = _mm256_loadu_ps(up_buf + i);
-                    /* Fast sigmoid: sig(x) ≈ 0.5 + 0.5 * x / (1 + |x|) */
-                    __m256 vabs = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), vg);
-                    __m256 vdenom = _mm256_add_ps(_mm256_set1_ps(1.0f), vabs);
-                    __m256 vsig = _mm256_add_ps(_mm256_set1_ps(0.5f),
-                                  _mm256_mul_ps(_mm256_set1_ps(0.5f),
-                                  _mm256_div_ps(vg, vdenom)));
-                    /* silu(x) = x * sig(x), then multiply by up */
-                    __m256 vsilu = _mm256_mul_ps(vg, vsig);
-                    _mm256_storeu_ps(act_buf + i, _mm256_mul_ps(vsilu, vu));
-                }
-                for (; i < I; i++) {
+                /* SwiGLU: act = silu(gate) * up — exact sigmoid */
+                for (i = 0; i < I; i++) {
                     float g = gate_buf[i];
-                    float sig = 0.5f + 0.5f * g / (1.0f + fabsf(g));
+                    float sig = 1.0f / (1.0f + expf(-g));
                     act_buf[i] = g * sig * up_buf[i];
                 }
 
@@ -1433,19 +1420,10 @@ int main(int argc, char** argv) {
                 quant_matvec(gate_buf, lw->shexp_gate, normed, I, H, lw->shexp_gate_type);
                 quant_matvec(up_buf, lw->shexp_up, normed, I, H, lw->shexp_up_type);
 
-                /* SwiGLU activation */
-                for (i = 0; i + 7 < I; i += 8) {
-                    __m256 vg = _mm256_loadu_ps(gate_buf + i);
-                    __m256 vu = _mm256_loadu_ps(up_buf + i);
-                    __m256 vabs = _mm256_andnot_ps(_mm256_set1_ps(-0.0f), vg);
-                    __m256 vdenom = _mm256_add_ps(_mm256_set1_ps(1.0f), vabs);
-                    __m256 vsig = _mm256_add_ps(_mm256_set1_ps(0.5f),
-                                  _mm256_mul_ps(_mm256_set1_ps(0.5f), _mm256_div_ps(vg, vdenom)));
-                    _mm256_storeu_ps(act_buf + i, _mm256_mul_ps(_mm256_mul_ps(vg, vsig), vu));
-                }
-                for (; i < I; i++) {
+                /* SwiGLU activation — exact sigmoid */
+                for (i = 0; i < I; i++) {
                     float g = gate_buf[i];
-                    float sig = 0.5f + 0.5f * g / (1.0f + fabsf(g));
+                    float sig = 1.0f / (1.0f + expf(-g));
                     act_buf[i] = g * sig * up_buf[i];
                 }
 
