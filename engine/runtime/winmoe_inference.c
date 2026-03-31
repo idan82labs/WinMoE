@@ -444,7 +444,7 @@ int main(int argc, char** argv) {
     cfg.intermediate = model.expert_intermediate;
     cfg.num_layers = model.num_layers;
     cfg.num_experts = model.num_experts;
-    cfg.expert_k = 10; /* Model designed for K=10 — correctness first */
+    cfg.expert_k = 10; /* Model designed for K=10 */
     cfg.rope_theta = model.rope_theta > 0 ? model.rope_theta : 10000000.0f;
     cfg.max_seq_len = MAX_SEQ;
     cfg.num_kv_heads = model.head_count_kv > 0 ? model.head_count_kv : 2;
