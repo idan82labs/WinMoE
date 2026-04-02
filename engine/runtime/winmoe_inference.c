@@ -463,8 +463,8 @@ int main(int argc, char** argv) {
     printf("Model: %s\n", gguf_path);
     printf("Config: hidden=%d, intermediate=%d, layers=%d\n",
            cfg.hidden_dim, cfg.intermediate, cfg.num_layers);
-    fprintf(stderr, "GGUF: expert_feed_forward_length=%d, feed_forward_length=%d\n",
-            model.expert_intermediate, model.feed_forward_length);
+    fprintf(stderr, "GGUF: expert_feed_forward_length=%d, feed_forward_length=%d, routed_scaling_factor=%.4f\n",
+            model.expert_intermediate, model.feed_forward_length, model.routed_scaling_factor);
     printf("Attention: Q=%d heads, KV=%d heads, head_dim=%d\n",
            cfg.num_q_heads, cfg.num_kv_heads, cfg.head_dim);
     printf("SSM: inner=%d state=%d head_count=%d\n",
@@ -877,12 +877,13 @@ int main(int argc, char** argv) {
 
                     /* L0 debug: print values at each stage */
                     if (tok == 0 && layer == 0 && lw->ssm_conv1d_w) {
-                        /* Conv1d weight: [channels=12288, kernel=4] in GGML layout */
-                        fprintf(stderr, "  conv1d_w[ch0][k0..3]: %.6f %.6f %.6f %.6f\n",
-                            lw->ssm_conv1d_w[0], lw->ssm_conv1d_w[1],
-                            lw->ssm_conv1d_w[2], lw->ssm_conv1d_w[3]);
-                        /* Conv weight layout: [4, 12288] → weight[k][channel] = w[k * 12288 + ch] */
-                        /* For channel 0: w[0], w[12288], w[24576], w[36864] = kernel positions 0-3 */
+                        /* Test both weight layouts to determine which is correct */
+                        fprintf(stderr, "  conv1d_w layout A [ch,k]: ch0=[%.6f %.6f %.6f %.6f] ch1=[%.6f %.6f %.6f %.6f]\n",
+                            lw->ssm_conv1d_w[0*4+0], lw->ssm_conv1d_w[0*4+1], lw->ssm_conv1d_w[0*4+2], lw->ssm_conv1d_w[0*4+3],
+                            lw->ssm_conv1d_w[1*4+0], lw->ssm_conv1d_w[1*4+1], lw->ssm_conv1d_w[1*4+2], lw->ssm_conv1d_w[1*4+3]);
+                        fprintf(stderr, "  conv1d_w layout B [k,ch]: ch0=[%.6f %.6f %.6f %.6f] ch1=[%.6f %.6f %.6f %.6f]\n",
+                            lw->ssm_conv1d_w[0*12288+0], lw->ssm_conv1d_w[1*12288+0], lw->ssm_conv1d_w[2*12288+0], lw->ssm_conv1d_w[3*12288+0],
+                            lw->ssm_conv1d_w[0*12288+1], lw->ssm_conv1d_w[1*12288+1], lw->ssm_conv1d_w[2*12288+1], lw->ssm_conv1d_w[3*12288+1]);
                     }
                     if (tok == 0 && layer == 0) {
                         fprintf(stderr, "=== L0 VALIDATION (tok=0) ===\n");
@@ -906,7 +907,7 @@ int main(int argc, char** argv) {
                             float sum = 0.0f;
                             for (int k = 0; k < DN_CONV_WIDTH; k++) {
                                 int hs = ((ds->conv_pos - 1 - k) % DN_CONV_WIDTH + DN_CONV_WIDTH) % DN_CONV_WIDTH;
-                                /* Kernel reversed: k=0 maps to oldest, kernel_size-1-k maps to newest */
+                                /* Reversed: k=0 → newest (paradox: works better than ggml direction) */
                                 sum += lw->ssm_conv1d_w[i * DN_CONV_WIDTH + k] * ds->conv_buf[hs * DN_QKV_DIM + i];
                             }
                             float sig = 1.0f / (1.0f + expf(-sum));
@@ -963,7 +964,7 @@ int main(int argc, char** argv) {
                     int h_idx, g_idx, d_idx, d2_idx;
 
                     for (h_idx = 0; h_idx < DN_NUM_Q_HEADS; h_idx++) {
-                        g_idx = h_idx / DN_HEADS_PER_GROUP;
+                        g_idx = h_idx / DN_HEADS_PER_GROUP; /* GROUPED order — matches this GGUF */
                         float* S = dn_states[layer].S + h_idx * DN_HEAD_DIM * DN_HEAD_DIM;
                         float* k = K_ptr + g_idx * DN_HEAD_DIM;  /* shared K from key group */
                         float* v = V_ptr + h_idx * DN_HEAD_DIM;  /* per-value-head V */
@@ -1477,8 +1478,8 @@ int main(int argc, char** argv) {
             /* 2k. Residual add */
             for (i = 0; i < H; i++) hidden[i] = residual[i] + moe_out[i];
 
-            /* DEBUG: track hidden state magnitude per layer (first token only) */
-            if (tok == 0 && layer <= 20) {
+            /* DEBUG: track hidden state magnitude per layer */
+            if (tok == 17 || (tok == 0 && layer <= 5)) { /* tok 17 = first generated token */
                 float hmag = 0; for (i = 0; i < H; i++) hmag += hidden[i] * hidden[i];
                 hmag = sqrtf(hmag / H);
                 float omag = 0; for (i = 0; i < H; i++) omag += o_out[i] * o_out[i];

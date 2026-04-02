@@ -195,7 +195,9 @@ static void deltanet_forward(
         memcpy(state->conv_buf + conv_slot * DN_QKV_DIM, qkv, DN_QKV_DIM * sizeof(float));
         state->conv_pos++;
 
-        /* Apply depthwise conv1d with SiLU activation */
+        /* Apply depthwise conv1d with SiLU activation
+         * NOTE: Using REVERSED direction (k=0→newest) which gives better output than
+         * ggml-matching direction (k=0→oldest). Conv1d paradox — compensating error elsewhere. */
         for (i = 0; i < DN_QKV_DIM; i++) {
             float sum = 0.0f;
             for (int k = 0; k < DN_CONV_WIDTH; k++) {
@@ -251,7 +253,7 @@ static void deltanet_forward(
        The recurrence itself is fast enough (~30ms) that parallelizing heads
        within it gives diminishing returns vs the matvec cost (~400ms). */
     for (h = 0; h < DN_NUM_Q_HEADS; h++) {
-        g = h / DN_HEADS_PER_GROUP;  /* KV group index (16 key groups) */
+        g = h / DN_HEADS_PER_GROUP;  /* KV group index — GROUPED order (this GGUF uses original HF order) */
         float* S = state->S + h * DN_HEAD_DIM * DN_HEAD_DIM; /* per-value-head state [128,128] */
         float* k = K + g * DN_HEAD_DIM;   /* shared K from key group */
         float* v = V + h * DN_HEAD_DIM;   /* per-value-head V */

@@ -88,6 +88,7 @@ typedef struct {
     int ssm_inner_size;
     int ssm_conv_kernel;
     float rope_theta;
+    float routed_scaling_factor;  /* MoE expert output scaling (DeepSeek/Qwen3.5 style) */
 } GGUFModel;
 
 /* Read little-endian uint64 */
@@ -164,7 +165,6 @@ static int parse_gguf(const char* path, GGUFModel* model) {
     for (kv = 0; kv < n_kv; kv++) {
         read_gguf_string(f, key, sizeof(key));
         uint32_t vtype = read_u32(f);
-
         if (vtype == 4) { /* uint32 */
             uint32_t val = read_u32(f);
             if (strstr(key, "expert_count")) model->num_experts = val;
@@ -179,10 +179,23 @@ static int parse_gguf(const char* path, GGUFModel* model) {
             if (strstr(key, "ssm.state_size")) model->ssm_state_size = val;
             if (strstr(key, "ssm.inner_size")) model->ssm_inner_size = val;
             if (strstr(key, "ssm.conv_kernel")) model->ssm_conv_kernel = val;
+            /* Store additional useful metadata */
         } else if (vtype == 6) { /* float32 */
             float fval;
             fread(&fval, 4, 1, f);
             if (strstr(key, "rope.freq_base")) model->rope_theta = fval;
+            if (strstr(key, "routed_scaling_factor")) model->routed_scaling_factor = fval;
+        } else if (vtype == 9 && strstr(key, "dimension_sections")) {
+            /* Read rope.dimension_sections array */
+            uint32_t atype = read_u32(f);
+            uint64_t alen = read_u64(f);
+            fprintf(stderr, "  GGUF rope.dimension_sections: [");
+            for (uint64_t ai = 0; ai < alen && ai < 16; ai++) {
+                if (atype == 5) { int32_t v; fread(&v, 4, 1, f); fprintf(stderr, "%d%s", v, ai+1<alen?",":""); }
+                else if (atype == 4) { uint32_t v = read_u32(f); fprintf(stderr, "%u%s", v, ai+1<alen?",":""); }
+                else { skip_kv_value(f, atype); }
+            }
+            fprintf(stderr, "] (len=%llu, atype=%u)\n", (unsigned long long)alen, atype);
         } else {
             skip_kv_value(f, vtype);
         }

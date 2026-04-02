@@ -40,7 +40,7 @@ static void rmsnorm(float* out, const float* x, const float* w, int dim) {
         __m256 vw = _mm256_loadu_ps(w + i);
         _mm256_storeu_ps(out + i, _mm256_mul_ps(_mm256_mul_ps(vx, vscale), vw));
     }
-    for (; i < dim; i++) out[i] = x[i] * ss * w[i];
+    for (; i < dim; i++) out[i] = x[i] * scale * w[i];
 }
 
 /* RoPE: apply rotary position embedding to Q and K */
