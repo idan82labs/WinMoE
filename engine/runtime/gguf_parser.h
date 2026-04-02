@@ -78,6 +78,7 @@ typedef struct {
     /* Model config (extracted from KV pairs) */
     int hidden_dim;
     int expert_intermediate;
+    int feed_forward_length;  /* for shared expert (non-MoE FFN) */
     int num_experts;
     int num_layers;
     int expert_used_count;
@@ -169,6 +170,8 @@ static int parse_gguf(const char* path, GGUFModel* model) {
             if (strstr(key, "expert_count")) model->num_experts = val;
             if (strstr(key, "expert_used_count")) model->expert_used_count = val;
             if (strstr(key, "expert_feed_forward_length")) model->expert_intermediate = val;
+            if (strstr(key, "feed_forward_length") && !strstr(key, "expert_feed_forward_length"))
+                model->feed_forward_length = val;
             if (strstr(key, "embedding_length")) model->hidden_dim = val;
             if (strstr(key, "block_count")) model->num_layers = val;
             if (strstr(key, "head_count_kv")) model->head_count_kv = val;

@@ -209,14 +209,14 @@ static int load_shared_weights(const char* gguf_path, GGUFModel* model,
         TensorInfo* t = find_tensor(model, name);
         if (t) {
             layers[l].attn_norm = (float*)load_tensor_data(model, t, &size);
-            /* No +1 convention for Qwen3.5 — norm weights are actual trained values */
+            /* GGUF stores w+1 for (1+w)-style RMSNorm. llama.cpp uses w+1 directly in standard RMSNorm.
+               Do NOT subtract 1 — the stored values are already correct for standard RMSNorm. */
         }
 
         snprintf(name, 256, "blk.%d.ffn_norm.weight", l);
         t = find_tensor(model, name);
         if (t) {
             layers[l].ffn_norm = (float*)load_tensor_data(model, t, &size);
-            /* No +1 convention */
         }
 
         /* Detect layer type: DeltaNet (has ssm_a) vs full attention (has attn_q) */
@@ -345,7 +345,6 @@ static int load_shared_weights(const char* gguf_path, GGUFModel* model,
         t = find_tensor(model, name);
         if (t) {
             layers[l].post_attn_norm = (float*)load_tensor_data(model, t, &size);
-            /* No +1 convention */
         }
 
         /* Router gate */
@@ -387,7 +386,11 @@ static int load_shared_weights(const char* gguf_path, GGUFModel* model,
         /* Shared expert weights (always active alongside routed experts) */
         snprintf(name, 256, "blk.%d.ffn_gate_shexp.weight", l);
         t = find_tensor(model, name);
-        if (t) { layers[l].shexp_gate = load_tensor_data(model, t, &size); layers[l].shexp_gate_type = t->type; }
+        if (t) {
+            layers[l].shexp_gate = load_tensor_data(model, t, &size); layers[l].shexp_gate_type = t->type;
+            if (l == 0) fprintf(stderr, "  SharedExp gate: dims=[%llu,%llu] type=%d size=%d\n",
+                (unsigned long long)t->dims[0], (unsigned long long)t->dims[1], t->type, size);
+        }
 
         snprintf(name, 256, "blk.%d.ffn_up_shexp.weight", l);
         t = find_tensor(model, name);
@@ -395,7 +398,11 @@ static int load_shared_weights(const char* gguf_path, GGUFModel* model,
 
         snprintf(name, 256, "blk.%d.ffn_down_shexp.weight", l);
         t = find_tensor(model, name);
-        if (t) { layers[l].shexp_down = load_tensor_data(model, t, &size); layers[l].shexp_down_type = t->type; }
+        if (t) {
+            layers[l].shexp_down = load_tensor_data(model, t, &size); layers[l].shexp_down_type = t->type;
+            if (l == 0) fprintf(stderr, "  SharedExp down: dims=[%llu,%llu] type=%d size=%d\n",
+                (unsigned long long)t->dims[0], (unsigned long long)t->dims[1], t->type, size);
+        }
 
         /* Shared expert sigmoid gate weight [hidden] FP32 */
         snprintf(name, 256, "blk.%d.ffn_gate_inp_shexp.weight", l);
@@ -456,6 +463,8 @@ int main(int argc, char** argv) {
     printf("Model: %s\n", gguf_path);
     printf("Config: hidden=%d, intermediate=%d, layers=%d\n",
            cfg.hidden_dim, cfg.intermediate, cfg.num_layers);
+    fprintf(stderr, "GGUF: expert_feed_forward_length=%d, feed_forward_length=%d\n",
+            model.expert_intermediate, model.feed_forward_length);
     printf("Attention: Q=%d heads, KV=%d heads, head_dim=%d\n",
            cfg.num_q_heads, cfg.num_kv_heads, cfg.head_dim);
     printf("SSM: inner=%d state=%d head_count=%d\n",
@@ -522,7 +531,6 @@ int main(int argc, char** argv) {
     }
     if (output_norm) {
         final_norm = (float*)load_tensor_data(&model, output_norm, &sz);
-        /* No +1 convention for Qwen3.5 norms — values ~1.7 are actual trained weights */
     }
     if (output_weight) {
         lm_head_type = output_weight->type;

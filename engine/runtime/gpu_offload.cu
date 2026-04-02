@@ -407,7 +407,7 @@ __global__ void swiglu_kernel(float* output, const float* gate, const float* up,
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
         float g = gate[i];
-        float sig = 0.5f + 0.5f * g / (1.0f + fabsf(g)); /* hard sigmoid — matches CPU */
+        float sig = 1.0f / (1.0f + expf(-g)); /* exact sigmoid — matches CPU */
         output[i] = g * sig * up[i];
     }
 }
