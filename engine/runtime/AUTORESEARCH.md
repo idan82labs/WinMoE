@@ -69,10 +69,39 @@ All 5 DeltaNet recurrence steps verified identical:
 - Our reversed (T12): w[3]*newest = matches ggml BUT gives worse output
 - Conclusion: our buffer ordering flipped relative to ggml, so unreversed compensates
 
-## STATUS: All algorithms correct, 12-point logit gap remains
-The issue is NOT in the algorithm — it's in how information accumulates across
-60 layers and 15 tokens. Could be subtle precision interaction, OpenMP thread
-ordering, or a minor numerical detail in the Q8_0 matmul accumulation.
+## Session 2 Trials (v10.25-v10.26)
+
+| Trial | Change | Result | Keep/Reject |
+|-------|--------|--------|-------------|
+| T14 | Subtract 1 from all norms (except ssm_norm) | h_rms EXPLODES (0.01→762K) | **reject** — GGUF stores correct values |
+| T15 | Fix GPU SwiGLU: hard sigmoid → exact sigmoid | peak logit 8.9→10.1 (+13%) | **KEEP** — GPU was wrong activation |
+| T15b | CPU-only experts (no GPU cache) | peak logit drops to 7.7 | reject — GPU experts are better |
+| T17 | Conv1d ggml direction (k=0→oldest) | peak logit 10.1→8.8 | reject — paradox persists |
+| T19 | Disable conv1d entirely | peak logit ~8.9, generates \n instead of 53 | neutral — conv1d not the bottleneck |
+| T20 | Compile without /fp:fast | peak logit drops to 6.0 | reject — /fp:fast helps |
+| T21 | V head tiled reorder (h%16 vs h/4) | peak logit 9→4.3 | reject — GGUF uses grouped order |
+
+## GGUF Metadata (verified)
+- key_length=256, value_length=256, rope_dim=64
+- full_attention_interval=4, ssm.group_count=16, ssm.time_step_rank=64
+- rope.dimension_sections=[11,11,10,0] (YaRN sectioned)
+- No routed_scaling_factor
+
+## Confirmed Correct
+- DeltaNet scale: 1/sqrt(128) ✓ (6 sources)
+- DeltaNet algorithm: norm→SiLU(gate)→proj ✓ (3 sources)
+- QKV split: Q(2048)+K(2048)+V(8192) ✓
+- Q+Gate deinterleave: [Q_h0(256),Gate_h0(256),...] ✓
+- RoPE: split-halves, partial 0.25, norm-then-rope ✓
+- V head grouping: h/4 (grouped, not tiled) ✓ (empirical)
+- All GGUF dimensions: match model config ✓
+
+## STATUS: GPU SwiGLU fixed, ~6-point gap remains (peak ~9 vs target ~15)
+- Run-to-run variance: ±1 point due to /fp:fast + OpenMP
+- Disabling conv1d has NO significant effect → gap is not from conv1d
+- /fp:fast gives +3 points over strict FP → accumulated precision matters
+- Next step: build llama.cpp with CUDA for layer-by-layer numerical comparison
+- Or: write Python reference implementation for single-layer validation
 
 ## Option B ready if needed
 Fall back to using llama.cpp for DeltaNet computation, our engine for MoE speed.

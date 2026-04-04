@@ -89,6 +89,7 @@ typedef struct {
     int ssm_conv_kernel;
     float rope_theta;
     float routed_scaling_factor;  /* MoE expert output scaling (DeepSeek/Qwen3.5 style) */
+    float rms_epsilon;            /* RMSNorm epsilon (we hardcode 1e-6, model might differ) */
 } GGUFModel;
 
 /* Read little-endian uint64 */
@@ -185,6 +186,7 @@ static int parse_gguf(const char* path, GGUFModel* model) {
             fread(&fval, 4, 1, f);
             if (strstr(key, "rope.freq_base")) model->rope_theta = fval;
             if (strstr(key, "routed_scaling_factor")) model->routed_scaling_factor = fval;
+            if (strstr(key, "rms_epsilon")) { model->rms_epsilon = fval; fprintf(stderr, "GGUF rms_epsilon = %.10f\n", fval); }
         } else if (vtype == 9 && strstr(key, "dimension_sections")) {
             /* Read rope.dimension_sections array */
             uint32_t atype = read_u32(f);

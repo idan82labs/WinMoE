@@ -1490,6 +1490,23 @@ int main(int argc, char** argv) {
                     layer, hmag, omag, mmag, layers[layer].is_deltanet ? " [DN]" : " [GQA]");
             }
 
+            /* T26: Dump hidden state for tok=0 layers 0-2 to binary files */
+            if (tok == 0 && layer <= 2) {
+                char fname[64];
+                snprintf(fname, 64, "hidden_L%d.bin", layer);
+                FILE* fh = fopen(fname, "wb");
+                if (fh) { fwrite(hidden, sizeof(float), H, fh); fclose(fh); }
+                float hrms2 = 0; for (i = 0; i < H; i++) hrms2 += hidden[i]*hidden[i];
+                fprintf(stderr, "  DUMP L%d: h[0..3]=%.6f %.6f %.6f %.6f rms=%.4f\n",
+                    layer, hidden[0], hidden[1], hidden[2], hidden[3], sqrtf(hrms2/H));
+            }
+
+            /* Debug: compact per-layer trace for last prompt token */
+            if (tok == prompt_len - 1 && layer % 4 == 0) {
+                float hrms = 0; for (i = 0; i < H; i++) hrms += hidden[i]*hidden[i];
+                fprintf(stderr, "  [T%d L%d] h[0]=%.3f h_rms=%.2f\n", tok, layer, hidden[0], sqrtf(hrms/H));
+            }
+
             /* Debug: trace per layer */
             if (tok == 0 && (layer == 0 || layer == cfg.num_layers - 1)) {
                 float hmax = 0;
@@ -1543,6 +1560,43 @@ int main(int argc, char** argv) {
 
         /* 4. LM head — project to vocab */
         if (lm_head) {
+            /* T26 DEBUG: verify Q6_K + check LM head row norms */
+            if (tok == 0 && lm_head_type == 14) {
+                int blocks_per_row = H / 256;
+                const block_q6_K* lm_blocks = (const block_q6_K*)lm_head;
+                int test_tokens[] = {32, 53, 872, 198, 0};
+                for (int tt = 0; tt < 5; tt++) {
+                    int tid = test_tokens[tt];
+                    double dot = 0.0;
+                    double row_norm_sq = 0.0;
+                    /* Dequant entire row and compute both dot product and L2 norm */
+                    for (int b = 0; b < blocks_per_row; b++) {
+                        const block_q6_K* blk = &lm_blocks[tid * blocks_per_row + b];
+                        float dequant[256];
+                        /* Simple Q6_K dequant for norm computation */
+                        float d_val = fp16_to_fp32(blk->d);
+                        for (int sub = 0; sub < 2; sub++) {
+                            for (int grp = 0; grp < 4; grp++) {
+                                int sc_idx = sub * 8 + grp * 2;
+                                float sc = d_val * (float)(blk->scales[sc_idx] - 32);
+                                for (int j = 0; j < 32; j++) {
+                                    int idx = sub * 128 + grp * 32 + j;
+                                    int ql_byte = blk->ql[sub*64 + grp*16 + (j < 16 ? j : j-16)];
+                                    int ql_val = (j < 16) ? (ql_byte & 0xF) : (ql_byte >> 4);
+                                    int qh_byte = blk->qh[sub*32 + grp*8 + j/4];
+                                    int qh_val = (qh_byte >> ((j%4)*2)) & 3;
+                                    int q = ql_val | (qh_val << 4);
+                                    dequant[idx] = sc * (float)(q - 32);
+                                    row_norm_sq += dequant[idx] * dequant[idx];
+                                }
+                            }
+                        }
+                        dot += q6k_dot_block(blk, &normed[b * 256]);
+                    }
+                    fprintf(stderr, "  LM[%d]: dot=%.4f row_norm=%.4f\n", tid, (float)dot, (float)sqrt(row_norm_sq));
+                }
+            }
+
             quant_matvec(logits, lm_head, normed, vocab_size, H, lm_head_type);
         } else {
             /* LM head not loaded (too large) — use normed[0] as dummy logit */
@@ -1604,6 +1658,19 @@ int main(int argc, char** argv) {
 
         QueryPerformanceCounter(&tok_end);
         double tok_ms = (double)(tok_end.QuadPart - tok_start.QuadPart) / freq.QuadPart * 1000.0;
+
+        /* Track logit confidence during prompt (correct token logit + margin) */
+        if (tok + 1 < prompt_len) {
+            int correct_next = prompt_tokens[tok + 1];
+            float correct_logit = logits[correct_next];
+            /* Find second-best logit for margin */
+            float second_best = -1e30f;
+            for (i = 0; i < vocab_size; i++)
+                if (i != best_token && logits[i] > second_best) second_best = logits[i];
+            fprintf(stderr, "  [CONF t%d] top1=%d(%.2f) correct=%d(%.2f) margin=%.2f max=%.2f\n",
+                tok, best_token, best_logit, correct_next, correct_logit,
+                best_logit - second_best, best_logit);
+        }
 
         /* During prompt: use next prompt token. After prompt: use generated token. */
         if (tok + 1 < prompt_len) {
