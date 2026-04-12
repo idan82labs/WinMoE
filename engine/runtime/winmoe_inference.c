@@ -515,6 +515,13 @@ int main(int argc, char** argv) {
     }
     printf("Loaded %d/%d layers with shared weights\n\n", loaded_layers, cfg.num_layers);
 
+    /* Critical struct size check */
+    fprintf(stderr, "STRUCT SIZES: block_q4_K=%d(expect 144) block_q5_K=%d(expect 176) block_q6_K=%d(expect 210)\n",
+        (int)sizeof(block_q4_K), (int)sizeof(block_q5_K), (int)sizeof(block_q6_K));
+    if (sizeof(block_q6_K) != 210 || sizeof(block_q4_K) != 144 || sizeof(block_q5_K) != 176) {
+        fprintf(stderr, "FATAL: Struct padding detected! This will corrupt weight addressing.\n");
+    }
+
     /* Weight audit: check all layers have required tensors */
     {
         int missing = 0;
@@ -1633,8 +1640,8 @@ int main(int argc, char** argv) {
             if (tok == 0 && lm_head_type == 14) {
                 int blocks_per_row = H / 256;
                 const block_q6_K* lm_blocks = (const block_q6_K*)lm_head;
-                int test_tokens[] = {32, 53, 872, 198, 0};
-                for (int tt = 0; tt < 5; tt++) {
+                int test_tokens[] = {32, 53, 872, 198, 13, 7294, 2245, 154378};
+                for (int tt = 0; tt < 8; tt++) {
                     int tid = test_tokens[tt];
                     double dot = 0.0;
                     double row_norm_sq = 0.0;
