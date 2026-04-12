@@ -754,9 +754,10 @@ int main(int argc, char** argv) {
 
     /* Start with token ID 9707 ("Hello") — hardcoded for now */
     /* Prompt: <|im_start|>user\nExplain quantum physics simply<|im_end|>\n<|im_start|>assistant\n<think>\n\nThe */
-    /* Prompt: <|im_start|>user\nExplain quantum physics simply<|im_end|>\n<|im_start|>assistant\n<think>\n\nThe */
-    int prompt_tokens[] = {151644, 872, 198, 840, 20772, 30128, 21321, 4936, 151645, 198, 151644, 77091, 198, 151667, 198, 198, 785};
-    int prompt_len = 17;
+    /* Prompt: <|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n
+     * CORRECT Qwen3.5 tokenizer IDs (248K vocab, NOT the old 152K Qwen2.5 IDs!) */
+    int prompt_tokens[] = {248045, 846, 198, 9419, 248046, 198, 248045, 74455, 198};
+    int prompt_len = 9;
     int cur_token = prompt_tokens[0];
     int tokens_generated = 0;
 
