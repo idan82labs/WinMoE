@@ -180,20 +180,22 @@ __global__ void q4k_matvec_kernel(float* output, const unsigned char* weights,
         const unsigned char* qs = blk + 16;
 
         float block_sum = 0.0f;
-        for (int sub = 0; sub < 8; sub++) {
-            int scale_val, min_val;
-            gpu_get_scale_min(sub, sc, &scale_val, &min_val);
-            float sc_f = d * (float)scale_val;
-            float mn_f = dmin * (float)min_val;
+        /* GGML Q4_K layout: 32 bytes per 64-weight chunk.
+         * Low nibbles of 32 bytes = sub-block A (32 weights, scale[2*chunk])
+         * High nibbles of 32 bytes = sub-block B (next 32 weights, scale[2*chunk+1]) */
+        for (int chunk = 0; chunk < 4; chunk++) {
+            int scale_lo, min_lo, scale_hi, min_hi;
+            gpu_get_scale_min(chunk*2,   sc, &scale_lo, &min_lo);
+            gpu_get_scale_min(chunk*2+1, sc, &scale_hi, &min_hi);
+            float sc_lo = d * (float)scale_lo, mn_lo = dmin * (float)min_lo;
+            float sc_hi = d * (float)scale_hi, mn_hi = dmin * (float)min_hi;
 
-            for (int j = 0; j < 16; j++) {
-                unsigned char packed = qs[sub * 16 + j];
-                /* GGML Q4_K: low nibble = weight[j], high nibble = weight[j+16] (BLOCKED, not interleaved) */
-                int idx0 = sub * 32 + j;       /* first 16 weights */
-                int idx1 = sub * 32 + j + 16;  /* second 16 weights */
-                float w0 = sc_f * (float)(packed & 0x0F) - mn_f;
-                float w1 = sc_f * (float)(packed >> 4) - mn_f;
-                block_sum += w0 * s_input[b * 256 + idx0] + w1 * s_input[b * 256 + idx1];
+            for (int j = 0; j < 32; j++) {
+                unsigned char packed = qs[chunk * 32 + j];
+                float w_lo = sc_lo * (float)(packed & 0x0F) - mn_lo;  /* sub-block A */
+                float w_hi = sc_hi * (float)(packed >> 4) - mn_hi;    /* sub-block B */
+                block_sum += w_lo * s_input[b * 256 + chunk * 64 + j]
+                           + w_hi * s_input[b * 256 + chunk * 64 + 32 + j];
             }
         }
         partial += block_sum;
@@ -241,24 +243,23 @@ __global__ void q5k_matvec_kernel(float* output, const unsigned char* weights,
         const unsigned char* qh = blk + 16;  /* 32 bytes of high bits */
         const unsigned char* qs = blk + 48;  /* 128 bytes of low nibbles */
 
+        /* GGML Q5_K: 32 bytes per 64-weight chunk */
         float block_sum = 0.0f;
-        for (int sub = 0; sub < 8; sub++) {
-            int scale_val, min_val;
-            gpu_get_scale_min(sub, sc, &scale_val, &min_val);
-            float sc_f = d * (float)scale_val;
-            float mn_f = dmin * (float)min_val;
+        for (int chunk = 0; chunk < 4; chunk++) {
+            int scale_lo, min_lo, scale_hi, min_hi;
+            gpu_get_scale_min(chunk*2,   sc, &scale_lo, &min_lo);
+            gpu_get_scale_min(chunk*2+1, sc, &scale_hi, &min_hi);
+            float sc_lo = d * (float)scale_lo, mn_lo = dmin * (float)min_lo;
+            float sc_hi = d * (float)scale_hi, mn_hi = dmin * (float)min_hi;
 
-            for (int j = 0; j < 16; j++) {
-                unsigned char packed = qs[sub * 16 + j];
-                /* GGML Q5_K: low nibble = weight[j], high nibble = weight[j+16] (BLOCKED)
-                 * High bit: qh[weight_j] >> sub, NOT qh[idx/8] >> (idx%8) */
-                int idx0 = sub * 32 + j;       /* first 16 weights */
-                int idx1 = sub * 32 + j + 16;  /* second 16 weights */
-                int q0 = (packed & 0x0F) | (((qh[j] >> sub) & 1) << 4);
-                int q1 = (packed >> 4) | (((qh[j + 16] >> sub) & 1) << 4);
-                float w0 = sc_f * (float)q0 - mn_f;
-                float w1 = sc_f * (float)q1 - mn_f;
-                block_sum += w0 * s_input[b * 256 + idx0] + w1 * s_input[b * 256 + idx1];
+            for (int j = 0; j < 32; j++) {
+                unsigned char packed = qs[chunk * 32 + j];
+                int q_lo = (packed & 0x0F) | (((qh[j] >> (chunk*2)) & 1) << 4);
+                int q_hi = (packed >> 4)   | (((qh[j] >> (chunk*2+1)) & 1) << 4);
+                float w_lo = sc_lo * (float)q_lo - mn_lo;
+                float w_hi = sc_hi * (float)q_hi - mn_hi;
+                block_sum += w_lo * s_input[b * 256 + chunk * 64 + j]
+                           + w_hi * s_input[b * 256 + chunk * 64 + 32 + j];
             }
         }
         partial += block_sum;
@@ -300,13 +301,13 @@ __global__ void q4k_expert_kernel(float* output, const unsigned char* weights,
         s_input[i] = input[i];
     __syncthreads();
 
-    /* Distribute at sub-block level: blocks_per_row * 8 work units */
+    /* Distribute at chunk level: blocks_per_row * 4 chunks (64 weights each) */
     float partial = 0.0f;
-    int total_subs = blocks_per_row * 8;
+    int total_chunks = blocks_per_row * 4;
 
-    for (int si = tid; si < total_subs; si += EXPERT_THREADS) {
-        int b = si / 8;
-        int sub = si % 8;
+    for (int ci = tid; ci < total_chunks; ci += EXPERT_THREADS) {
+        int b = ci / 4;
+        int chunk = ci % 4;
 
         const unsigned char* blk = row_data + b * 144;
         half d_h, dmin_h;
@@ -318,22 +319,24 @@ __global__ void q4k_expert_kernel(float* output, const unsigned char* weights,
         const unsigned char* sc = blk + 4;
         const unsigned char* qs = blk + 16;
 
-        int scale_val, min_val;
-        gpu_get_scale_min(sub, sc, &scale_val, &min_val);
-        float sc_f = d * (float)scale_val;
-        float mn_f = dmin * (float)min_val;
+        /* GGML Q4_K: 32 bytes per chunk, low nibbles = sub-block A, high = sub-block B */
+        int scale_lo, min_lo, scale_hi, min_hi;
+        gpu_get_scale_min(chunk*2,   sc, &scale_lo, &min_lo);
+        gpu_get_scale_min(chunk*2+1, sc, &scale_hi, &min_hi);
+        float sc_lo = d * (float)scale_lo, mn_lo = dmin * (float)min_lo;
+        float sc_hi = d * (float)scale_hi, mn_hi = dmin * (float)min_hi;
 
-        float sub_sum = 0.0f;
-        const unsigned char* qp = qs + sub * 16;
-        int base_idx = b * 256 + sub * 32;
+        float chunk_sum = 0.0f;
+        const unsigned char* qp = qs + chunk * 32;
+        int base_idx = b * 256 + chunk * 64;
         #pragma unroll
-        for (int j = 0; j < 16; j++) {
+        for (int j = 0; j < 32; j++) {
             unsigned char packed = __ldg(qp + j);
-            float w0 = sc_f * (float)(packed & 0x0F) - mn_f;
-            float w1 = sc_f * (float)(packed >> 4) - mn_f;
-            sub_sum += w0 * s_input[base_idx + j] + w1 * s_input[base_idx + j + 16];
+            float w_lo = sc_lo * (float)(packed & 0x0F) - mn_lo;
+            float w_hi = sc_hi * (float)(packed >> 4) - mn_hi;
+            chunk_sum += w_lo * s_input[base_idx + j] + w_hi * s_input[base_idx + 32 + j];
         }
-        partial += sub_sum;
+        partial += chunk_sum;
     }
 
     /* Warp-only reduction (32 threads = 1 warp, no block reduction needed) */
@@ -356,12 +359,13 @@ __global__ void q5k_expert_kernel(float* output, const unsigned char* weights,
         s_input[i] = input[i];
     __syncthreads();
 
+    /* GGML Q5_K: 32 bytes per 64-weight chunk, low nibbles = sub-block A, high = sub-block B */
     float partial = 0.0f;
-    int total_subs = blocks_per_row * 8;
+    int total_chunks = blocks_per_row * 4;
 
-    for (int si = tid; si < total_subs; si += EXPERT_THREADS) {
-        int b = si / 8;
-        int sub = si % 8;
+    for (int ci = tid; ci < total_chunks; ci += EXPERT_THREADS) {
+        int b = ci / 4;
+        int chunk = ci % 4;
 
         const unsigned char* blk = row_data + b * 176;
         half d_h, dmin_h;
@@ -374,27 +378,26 @@ __global__ void q5k_expert_kernel(float* output, const unsigned char* weights,
         const unsigned char* qh = blk + 16;
         const unsigned char* qs = blk + 48;
 
-        int scale_val, min_val;
-        gpu_get_scale_min(sub, sc, &scale_val, &min_val);
-        float sc_f = d * (float)scale_val;
-        float mn_f = dmin * (float)min_val;
+        int scale_lo, min_lo, scale_hi, min_hi;
+        gpu_get_scale_min(chunk*2,   sc, &scale_lo, &min_lo);
+        gpu_get_scale_min(chunk*2+1, sc, &scale_hi, &min_hi);
+        float sc_lo = d * (float)scale_lo, mn_lo = dmin * (float)min_lo;
+        float sc_hi = d * (float)scale_hi, mn_hi = dmin * (float)min_hi;
 
-        float sub_sum = 0.0f;
-        const unsigned char* qp = qs + sub * 16;
-        int base_idx = b * 256 + sub * 32;
+        float chunk_sum = 0.0f;
+        const unsigned char* qp = qs + chunk * 32;
+        int base_idx = b * 256 + chunk * 64;
         #pragma unroll
-        for (int j = 0; j < 16; j++) {
+        for (int j = 0; j < 32; j++) {
             unsigned char packed = __ldg(qp + j);
-            int wi0 = sub * 32 + j;       /* first 16 weights (blocked) */
-            int wi1 = sub * 32 + j + 16; /* second 16 weights */
-            /* Q5_K high bit: qh[j] >> sub, NOT qh[idx/8] >> (idx%8) */
-            int q0 = (packed & 0x0F) | (((qh[j] >> sub) & 1) << 4);
-            int q1 = (packed >> 4) | (((qh[j + 16] >> sub) & 1) << 4);
-            float w0 = sc_f * (float)q0 - mn_f;
-            float w1 = sc_f * (float)q1 - mn_f;
-            sub_sum += w0 * s_input[base_idx + j] + w1 * s_input[base_idx + j + 16];
+            /* Q5_K high bits: bit (chunk*2) for low nibbles, bit (chunk*2+1) for high */
+            int q_lo = (packed & 0x0F) | (((qh[j] >> (chunk*2)) & 1) << 4);
+            int q_hi = (packed >> 4)   | (((qh[j] >> (chunk*2+1)) & 1) << 4);
+            float w_lo = sc_lo * (float)q_lo - mn_lo;
+            float w_hi = sc_hi * (float)q_hi - mn_hi;
+            chunk_sum += w_lo * s_input[base_idx + j] + w_hi * s_input[base_idx + 32 + j];
         }
-        partial += sub_sum;
+        partial += chunk_sum;
     }
 
     for (int offset = 16; offset > 0; offset >>= 1)

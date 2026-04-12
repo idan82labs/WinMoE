@@ -126,22 +126,32 @@ static inline float q4k_dot_q8k(const block_q4_K* w, const block_q8_K* a) {
         min_sum += (int32_t)mins_arr[sub] * (a->bsums[sub*2] + a->bsums[sub*2+1]);
     }
 
-    /* AVX2 integer dot product — maddubs + madd (optimal for per-sub-block scales) */
+    /* AVX2 integer dot product — matches GGML ggml_vec_dot_q4_K_q8_K layout.
+     * Q4_K stores 32 bytes per 64-weight chunk: low nibbles = sub-block A (32 weights),
+     * high nibbles = sub-block B (next 32 weights, DIFFERENT scale). */
     __m256i sumi = _mm256_setzero_si256();
     __m256i m4 = _mm256_set1_epi8(0x0F);
 
-    for (sub = 0; sub < 8; sub++) {
-        __m256i vscale = _mm256_set1_epi16((int16_t)scales[sub]);
+    for (int chunk = 0; chunk < 4; chunk++) { /* 4 chunks of 64 weights = 256 total */
+        int sb_lo = chunk * 2;     /* sub-block index for low nibbles */
+        int sb_hi = chunk * 2 + 1; /* sub-block index for high nibbles */
 
-        __m128i q4raw = _mm_loadu_si128((const __m128i*)(qs + sub * 16));
-        __m256i q4bytes = _mm256_set_m128i(_mm_srli_epi16(q4raw, 4), q4raw);
-        q4bytes = _mm256_and_si256(q4bytes, m4);
+        /* Load 32 bytes of Q4 data */
+        __m256i q4bits = _mm256_loadu_si256((const __m256i*)(qs + chunk * 32));
+        __m256i q4l = _mm256_and_si256(q4bits, m4);                              /* low nibbles → sub-block A */
+        __m256i q4h = _mm256_and_si256(_mm256_srli_epi16(q4bits, 4), m4);        /* high nibbles → sub-block B */
 
-        __m256i q8v = _mm256_loadu_si256((const __m256i*)(q8 + sub * 32));
+        /* Low nibbles × first 32 Q8_K values (sub-block A) */
+        __m256i q8l = _mm256_loadu_si256((const __m256i*)(q8 + chunk * 64));
+        __m256i p16l = _mm256_maddubs_epi16(q4l, q8l);
+        __m256i p32l = _mm256_madd_epi16(_mm256_set1_epi16((int16_t)scales[sb_lo]), p16l);
+        sumi = _mm256_add_epi32(sumi, p32l);
 
-        __m256i p16 = _mm256_maddubs_epi16(q4bytes, q8v);
-        __m256i p32 = _mm256_madd_epi16(vscale, p16);
-        sumi = _mm256_add_epi32(sumi, p32);
+        /* High nibbles × next 32 Q8_K values (sub-block B) */
+        __m256i q8h = _mm256_loadu_si256((const __m256i*)(q8 + chunk * 64 + 32));
+        __m256i p16h = _mm256_maddubs_epi16(q4h, q8h);
+        __m256i p32h = _mm256_madd_epi16(_mm256_set1_epi16((int16_t)scales[sb_hi]), p16h);
+        sumi = _mm256_add_epi32(sumi, p32h);
     }
 
     /* Convert accumulated int32 to float */

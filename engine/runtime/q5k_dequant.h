@@ -100,32 +100,47 @@ static inline float q5k_dot_q8k(const block_q5_K* w, const block_q8_K* a) {
     __m256i sumi = _mm256_setzero_si256();
     __m256i m4 = _mm256_set1_epi8(0x0F);
 
-    for (sub = 0; sub < 8; sub++) {
-        __m256i vscale = _mm256_set1_epi16((int16_t)scales[sub]);
+    /* GGML Q5_K layout: 32 bytes per 64-weight chunk, same as Q4_K.
+     * Low nibbles of 32 bytes = sub-block A (32 weights), high nibbles = sub-block B.
+     * High bits: qh[l] & (1 << chunk*2) for sub-block A, qh[l] & (1 << chunk*2+1) for B. */
+    for (int chunk = 0; chunk < 4; chunk++) {
+        int sb_lo = chunk * 2;
+        int sb_hi = chunk * 2 + 1;
+        __m256i vscale_lo = _mm256_set1_epi16((int16_t)scales[sb_lo]);
+        __m256i vscale_hi = _mm256_set1_epi16((int16_t)scales[sb_hi]);
 
-        /* Load 16 bytes of qs → 32 nibbles (low and high halves) */
-        __m128i q5raw = _mm_loadu_si128((const __m128i*)(qs + sub * 16));
-        __m256i q5bytes = _mm256_set_m128i(_mm_srli_epi16(q5raw, 4), q5raw);
-        __m256i q4lo = _mm256_and_si256(q5bytes, m4);
+        /* Load 32 bytes of qs */
+        __m256i q5bits = _mm256_loadu_si256((const __m256i*)(qs + chunk * 32));
+        __m256i q5_lo = _mm256_and_si256(q5bits, m4);                           /* low nibbles → sub-block A */
+        __m256i q5_hi = _mm256_and_si256(_mm256_srli_epi16(q5bits, 4), m4);     /* high nibbles → sub-block B */
 
-        /* Extract high bits: AND hbits with current mask, shift to bit 4 */
-        __m256i q5h = _mm256_and_si256(hbits, hmask);
-        /* Shift high bit into position 4 of each byte */
-        /* q5h has 1 or 0 in each byte position. We need it at bit 4. */
-        __m256i q5h_shifted = _mm256_slli_epi16(q5h, 4);
-        /* Combine: OR in the high bit */
-        __m256i q5v = _mm256_or_si256(q4lo, q5h_shifted);
+        /* High bits for sub-block A: bit (chunk*2) of each qh byte */
+        __m256i hmask_lo = _mm256_set1_epi8(1 << (chunk * 2));
+        __m256i qh_lo = _mm256_and_si256(hbits, hmask_lo);
+        __m256i qh_lo_shifted = _mm256_slli_epi16(qh_lo, 4);
+        /* Need to normalize: qh_lo has bit at position chunk*2, need at position 4 */
+        /* Actually: shift right by chunk*2 then left by 4, net = left by (4-chunk*2) */
+        /* Simpler: cmpeq to get 0xFF or 0, then AND with 16 */
+        __m256i qh_lo_flag = _mm256_cmpeq_epi8(qh_lo, hmask_lo); /* 0xFF if bit set, 0 if not */
+        __m256i q5v_lo = _mm256_or_si256(q5_lo, _mm256_and_si256(qh_lo_flag, _mm256_set1_epi8(16)));
 
-        /* Advance high-bit mask for next sub-block */
-        hmask = _mm256_slli_epi16(hmask, 1);
+        /* High bits for sub-block B: bit (chunk*2+1) */
+        __m256i hmask_hi = _mm256_set1_epi8(1 << (chunk * 2 + 1));
+        __m256i qh_hi = _mm256_and_si256(hbits, hmask_hi);
+        __m256i qh_hi_flag = _mm256_cmpeq_epi8(qh_hi, hmask_hi);
+        __m256i q5v_hi = _mm256_or_si256(q5_hi, _mm256_and_si256(qh_hi_flag, _mm256_set1_epi8(16)));
 
-        /* Load Q8 values */
-        __m256i q8v = _mm256_loadu_si256((const __m256i*)(q8 + sub * 32));
+        /* Sub-block A × Q8 */
+        __m256i q8l = _mm256_loadu_si256((const __m256i*)(q8 + chunk * 64));
+        __m256i p16l = _mm256_maddubs_epi16(q5v_lo, q8l);
+        __m256i p32l = _mm256_madd_epi16(vscale_lo, p16l);
+        sumi = _mm256_add_epi32(sumi, p32l);
 
-        /* u8 * s8 → s16, then scale */
-        __m256i p16 = _mm256_maddubs_epi16(q5v, q8v);
-        __m256i p32 = _mm256_madd_epi16(vscale, p16);
-        sumi = _mm256_add_epi32(sumi, p32);
+        /* Sub-block B × Q8 */
+        __m256i q8h = _mm256_loadu_si256((const __m256i*)(q8 + chunk * 64 + 32));
+        __m256i p16h = _mm256_maddubs_epi16(q5v_hi, q8h);
+        __m256i p32h = _mm256_madd_epi16(vscale_hi, p16h);
+        sumi = _mm256_add_epi32(sumi, p32h);
     }
 
     /* Convert to float */
