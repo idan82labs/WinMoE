@@ -1713,11 +1713,11 @@ int main(int argc, char** argv) {
             for (i = 0; i < 10; i++)
                 fprintf(stderr, "  #%d: id=%d logit=%.4f\n", i+1, top_ids[i], top_vals[i]);
             /* Check where expected token ranks */
-            fprintf(stderr, "  Token 151644 (<|im_start|>) logit=%.4f\n", logits[151644]);
-            fprintf(stderr, "  Token 151667 (<think>) logit=%.4f\n", logits[151667]);
-            fprintf(stderr, "  Token 151668 (</think>) logit=%.4f\n", logits[151668]);
-            fprintf(stderr, "  Token 198 (\\n) logit=%.4f  Token 8420 (Here) logit=%.4f\n",
-                logits[198], logits[8420]);
+            fprintf(stderr, "  Token 248045 (<|im_start|>) logit=%.4f\n", logits[248045]);
+            fprintf(stderr, "  Token 248068 (<think>) logit=%.4f\n", logits[248068]);
+            fprintf(stderr, "  Token 248069 (</think>) logit=%.4f\n", logits[248069]);
+            fprintf(stderr, "  Token 198 (\\n) logit=%.4f  Token 9419 (Hello) logit=%.4f\n",
+                logits[198], logits[9419]);
             int nan_count = 0;
             for (i = 0; i < vocab_size; i++) if (logits[i] != logits[i]) nan_count++;
             if (nan_count > 0) fprintf(stderr, "WARNING: %d NaN logits!\n", nan_count);
