@@ -1559,8 +1559,8 @@ int main(int argc, char** argv) {
                     layer, hmag, omag, mmag, layers[layer].is_deltanet ? " [DN]" : " [GQA]");
             }
 
-            /* T26: Dump hidden state for tok=0 layers 0-2 to binary files */
-            if (tok == 0 && layer <= 2) {
+            /* Dump hidden state trajectory for tok=0 ALL layers */
+            if (tok == 0) {
                 char fname[64];
                 snprintf(fname, 64, "hidden_L%d.bin", layer);
                 FILE* fh = fopen(fname, "wb");
