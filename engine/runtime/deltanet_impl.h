@@ -207,12 +207,11 @@ static void deltanet_forward(
         state->conv_pos++;
 
         /* Apply depthwise conv1d with SiLU activation
-         * NOTE: Using REVERSED direction (k=0→newest) which gives better output than
-         * ggml-matching direction (k=0→oldest). Conv1d paradox — compensating error elsewhere. */
+         * ggml convention: k=0 → oldest, k=d_conv-1 → newest */
         for (i = 0; i < DN_QKV_DIM; i++) {
             float sum = 0.0f;
             for (int k = 0; k < DN_CONV_WIDTH; k++) {
-                int hist_slot = ((state->conv_pos - 1 - k) % DN_CONV_WIDTH + DN_CONV_WIDTH) % DN_CONV_WIDTH;
+                int hist_slot = ((state->conv_pos - DN_CONV_WIDTH + k) % DN_CONV_WIDTH + DN_CONV_WIDTH) % DN_CONV_WIDTH;
                 sum += conv1d_w[i * DN_CONV_WIDTH + k] * state->conv_buf[hist_slot * DN_QKV_DIM + i];
             }
             /* SiLU activation: x * sigmoid(x) */

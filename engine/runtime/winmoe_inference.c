@@ -515,6 +515,20 @@ int main(int argc, char** argv) {
     }
     printf("Loaded %d/%d layers with shared weights\n\n", loaded_layers, cfg.num_layers);
 
+    /* Weight audit: check all layers have required tensors */
+    {
+        int missing = 0;
+        for (i = 0; i < cfg.num_layers; i++) {
+            if (!layers[i].attn_norm) { fprintf(stderr, "AUDIT: L%d missing attn_norm!\n", i); missing++; }
+            if (!layers[i].post_attn_norm && !layers[i].ffn_norm) { fprintf(stderr, "AUDIT: L%d missing post_attn_norm AND ffn_norm!\n", i); missing++; }
+            if (!layers[i].gate_inp) { fprintf(stderr, "AUDIT: L%d missing gate_inp (router)!\n", i); missing++; }
+            if (layers[i].is_deltanet && !layers[i].ssm_a) { fprintf(stderr, "AUDIT: L%d (DN) missing ssm_a!\n", i); missing++; }
+            if (!layers[i].is_deltanet && !layers[i].wq) { fprintf(stderr, "AUDIT: L%d (GQA) missing wq!\n", i); missing++; }
+        }
+        if (missing == 0) fprintf(stderr, "AUDIT: All %d layers have required weights.\n", cfg.num_layers);
+        else fprintf(stderr, "AUDIT: %d MISSING weights found!\n", missing);
+    }
+
     /* Load embedding and LM head */
     TensorInfo* tok_embd = find_tensor(&model, "token_embd.weight");
     TensorInfo* output_norm = find_tensor(&model, "output_norm.weight");
@@ -826,6 +840,7 @@ int main(int argc, char** argv) {
             if (lw->attn_norm) {
                 rmsnorm(normed, hidden, lw->attn_norm, H);
             } else {
+                if (tok == 0) fprintf(stderr, "WARNING: L%d has NO attn_norm! Using raw hidden.\n", layer);
                 memcpy(normed, hidden, H * sizeof(float));
             }
 
@@ -918,8 +933,8 @@ int main(int argc, char** argv) {
                         for (i = 0; i < DN_QKV_DIM; i++) {
                             float sum = 0.0f;
                             for (int k = 0; k < DN_CONV_WIDTH; k++) {
-                                int hs = ((ds->conv_pos - 1 - k) % DN_CONV_WIDTH + DN_CONV_WIDTH) % DN_CONV_WIDTH;
-                                /* Reversed: k=0 → newest (paradox: works better than ggml direction) */
+                                int hs = ((ds->conv_pos - DN_CONV_WIDTH + k) % DN_CONV_WIDTH + DN_CONV_WIDTH) % DN_CONV_WIDTH;
+                                /* ggml convention: k=0 → oldest, k=d_conv-1 → newest */
                                 sum += lw->ssm_conv1d_w[i * DN_CONV_WIDTH + k] * ds->conv_buf[hs * DN_QKV_DIM + i];
                             }
                             float sig = 1.0f / (1.0f + expf(-sum));
@@ -1248,6 +1263,7 @@ int main(int argc, char** argv) {
             } else if (lw->ffn_norm) {
                 rmsnorm(normed, hidden, lw->ffn_norm, H);
             } else {
+                if (tok == 0) fprintf(stderr, "WARNING: L%d has NO post-attn norm! Using raw hidden.\n", layer);
                 memcpy(normed, hidden, H * sizeof(float));
             }
 
