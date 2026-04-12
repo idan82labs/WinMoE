@@ -292,11 +292,11 @@ static int load_shared_weights(const char* gguf_path, GGUFModel* model,
             if (!lazy_attn) {
                 snprintf(name, 256, "blk.%d.attn_q.weight", l);
                 t = find_tensor(model, name);
-                if (t) { layers[l].wq = load_tensor_data(model, t, &size); layers[l].wq_type = t->type; }
+                if (t) { layers[l].wq = load_tensor_data(model, t, &size); layers[l].wq_type = t->type; layers[l].wq_rows = (int)t->dims[1]; }
 
                 snprintf(name, 256, "blk.%d.attn_k.weight", l);
                 t = find_tensor(model, name);
-                if (t) { layers[l].wk = load_tensor_data(model, t, &size); layers[l].wk_type = t->type; }
+                if (t) { layers[l].wk = load_tensor_data(model, t, &size); layers[l].wk_type = t->type; layers[l].wk_rows = (int)t->dims[1]; }
 
                 snprintf(name, 256, "blk.%d.attn_v.weight", l);
                 t = find_tensor(model, name);
@@ -312,6 +312,7 @@ static int load_shared_weights(const char* gguf_path, GGUFModel* model,
                 if (t) {
                     layers[l].wq = load_tensor_data(model, t, &size);
                     layers[l].wq_type = t->type;
+                    layers[l].wq_rows = (int)t->dims[1];
                     if (l == 3) /* first standard layer */
                         fprintf(stderr, "Std attn L%d: Q dims=[%llu,%llu] type=%d size=%llu\n",
                             l, t->dims[0], t->dims[1], t->type, t->data_size);
@@ -319,7 +320,7 @@ static int load_shared_weights(const char* gguf_path, GGUFModel* model,
 
                 snprintf(name, 256, "blk.%d.attn_k.weight", l);
                 t = find_tensor(model, name);
-                if (t) { layers[l].wk = load_tensor_data(model, t, &size); layers[l].wk_type = t->type; }
+                if (t) { layers[l].wk = load_tensor_data(model, t, &size); layers[l].wk_type = t->type; layers[l].wk_rows = (int)t->dims[1]; }
 
                 snprintf(name, 256, "blk.%d.attn_v.weight", l);
                 t = find_tensor(model, name);
@@ -363,6 +364,9 @@ static int load_shared_weights(const char* gguf_path, GGUFModel* model,
             layers[l].gate_per_expert = t->data_size / model->num_experts;
             layers[l].gate_exps_type = t->type;
             layers[l].gate_exps_shard = t->shard;
+            if (l <= 2) fprintf(stderr, "  L%d gate_exps: shard=%d offset=%llu per_exp=%llu type=%d data_size=%llu\n",
+                l, t->shard, (unsigned long long)t->offset,
+                (unsigned long long)layers[l].gate_per_expert, t->type, (unsigned long long)t->data_size);
         }
 
         snprintf(name, 256, "blk.%d.ffn_up_exps.weight", l);
@@ -459,6 +463,14 @@ int main(int argc, char** argv) {
     cfg.head_dim = model.ssm_state_size > 0 ? model.ssm_state_size : 128;
     cfg.num_q_heads = (model.ssm_inner_size > 0) ?
         (model.ssm_inner_size / cfg.head_dim) : (cfg.hidden_dim / cfg.head_dim);
+
+    /* Initialize DeltaNet dimensions from GGUF metadata */
+    {
+        int ssm_inner = model.ssm_inner_size > 0 ? model.ssm_inner_size : 8192;
+        int ssm_groups = 16; /* from GGUF ssm.group_count, hardcode for now */
+        int ssm_hd = model.ssm_state_size > 0 ? model.ssm_state_size : 128;
+        dn_init_dims(ssm_inner, ssm_groups, ssm_hd);
+    }
 
     printf("Model: %s\n", gguf_path);
     printf("Config: hidden=%d, intermediate=%d, layers=%d\n",
@@ -586,9 +598,8 @@ int main(int argc, char** argv) {
         if (layers[i].is_deltanet) {
             dn_state_init(&dn_states[i]);
         } else {
-            /* Standard attention: head_dim=256 (from Q weight [4096,16384] → 32 heads × 256 × 2) */
-            int std_hd = 256;
-            int std_nqh = 32;
+            /* Standard attention: detect head_dim from K weight dims */
+            int std_hd = layers[i].wk_rows > 0 ? layers[i].wk_rows / cfg.num_kv_heads : 256;
             kv_cache_init(&kv_caches[i], MAX_SEQ, cfg.num_kv_heads, std_hd);
         }
     }
@@ -721,6 +732,7 @@ int main(int argc, char** argv) {
     LARGE_INTEGER prof_t0, prof_t1;
 
     /* Start with token ID 9707 ("Hello") — hardcoded for now */
+    /* Prompt: <|im_start|>user\nExplain quantum physics simply<|im_end|>\n<|im_start|>assistant\n<think>\n\nThe */
     /* Prompt: <|im_start|>user\nExplain quantum physics simply<|im_end|>\n<|im_start|>assistant\n<think>\n\nThe */
     int prompt_tokens[] = {151644, 872, 198, 840, 20772, 30128, 21321, 4936, 151645, 198, 151644, 77091, 198, 151667, 198, 198, 785};
     int prompt_len = 17;
@@ -940,8 +952,8 @@ int main(int argc, char** argv) {
                     float* V_ptr = gpu_qkv + DN_KEY_DIM + DN_KEY_DIM;
 
                     /* Compute gate parameters */
-                    float gate_decay[DN_NUM_GATES];
-                    float beta_vals[DN_NUM_GATES];
+                    float* gate_decay = (float*)_malloca(DN_NUM_GATES * sizeof(float));
+                    float* beta_vals = (float*)_malloca(DN_NUM_GATES * sizeof(float));
                     int hi;
                     for (hi = 0; hi < DN_NUM_GATES; hi++) {
                         float a_val = (lw->ssm_a && lw->ssm_dt_bias) ?
@@ -1090,11 +1102,13 @@ int main(int argc, char** argv) {
                 }
             } else if (lw->wq && lw->wk && lw->wv && lw->wo) {
                 /* === STANDARD GQA ATTENTION (Qwen3.5: gated + QK norm + partial RoPE) === */
-                /* Standard attention: Q=[4096,16384], so 32 heads × 256 dim × 2 (gate) */
-                int nqh = 32;
+                /* Detect nqh and hd from Q weight dims: Q_out = nqh * hd * 2 (doubled for gate) */
                 int nkvh = cfg.num_kv_heads; /* 2 */
-                int hd = 256; /* confirmed from Q weight dims: 16384 / 32 / 2 = 256 */
-                int q_out_dim = nqh * hd * 2; /* 16384, doubled for Q+gate */
+                int q_out_dim = lw->wq_rows; /* Total Q+gate output dim from weight tensor */
+                /* hd from GGUF key_length, or derive: K_out = nkvh * hd */
+                int hd = lw->wk_rows / nkvh; /* wk_rows = K output dim = nkvh * hd */
+                int nqh = q_out_dim / (hd * 2); /* Q+gate = nqh * hd * 2 */
+                if (hd <= 0 || nqh <= 0) { hd = 256; nqh = 32; q_out_dim = nqh * hd * 2; } /* fallback */
                 int kv_out_dim = nkvh * hd;   /* 512 */
                 int attn_dim = nqh * hd;      /* 8192 */
 
@@ -1271,6 +1285,21 @@ int main(int argc, char** argv) {
             block_q8_K* normed_q8k = (block_q8_K*)_malloca(q8k_blocks * sizeof(block_q8_K));
             if (normed_q8k) quantize_row_q8_K(normed_q8k, normed, H);
 
+            /* T27: Dump first expert's FFN output for layer 0 tok 0 */
+            if (tok == 0 && layer == 0) {
+                /* Dump MoE input (normed) for Python verification */
+                { FILE* fn = fopen("moe_normed_L0.bin","wb"); if(fn){fwrite(normed,sizeof(float),H,fn);fclose(fn);} }
+                fprintf(stderr, "  MoE L0: experts=[%d,%d,%d] weights=[%.4f,%.4f,%.4f] per_expert=[%llu,%llu,%llu]\n",
+                    expert_ids[0], expert_ids[1], expert_ids[2],
+                    expert_weights[0], expert_weights[1], expert_weights[2],
+                    (unsigned long long)lw->gate_per_expert,
+                    (unsigned long long)lw->up_per_expert,
+                    (unsigned long long)lw->down_per_expert);
+                { float nrms2=0; for(int ii=0;ii<H;ii++) nrms2+=normed[ii]*normed[ii];
+                fprintf(stderr, "  MoE L0: normed_rms=%.4f normed[0..3]=%.4f %.4f %.4f %.4f\n",
+                    sqrtf(nrms2/H), normed[0], normed[1], normed[2], normed[3]); }
+            }
+
             /* 2j. Expert FFN for each selected expert */
             memset(moe_out, 0, H * sizeof(float));
             for (int ek = 0; ek < K; ek++) {
@@ -1411,6 +1440,22 @@ int main(int argc, char** argv) {
                     act_buf[i] = g * sig * up_buf[i];
                 }
 
+                /* T27: dump first CPU expert's intermediate values */
+                if (tok == 0 && layer == 0 && ek == 0) {
+                    float grms=0,urms=0,arms=0;
+                    for (i=0;i<I;i++) {grms+=gate_buf[i]*gate_buf[i]; urms+=up_buf[i]*up_buf[i]; arms+=act_buf[i]*act_buf[i];}
+                    fprintf(stderr, "  Expert[%d] CPU: gate_rms=%.4f up_rms=%.4f act_rms=%.4f\n",
+                        eid, sqrtf(grms/I), sqrtf(urms/I), sqrtf(arms/I));
+                    fprintf(stderr, "  Expert[%d] CPU: gate[0..3]=%.4f %.4f %.4f %.4f\n",
+                        eid, gate_buf[0], gate_buf[1], gate_buf[2], gate_buf[3]);
+                    /* Verify Q4_K block header */
+                    const unsigned char* graw = (const unsigned char*)gate_data;
+                    uint16_t gd16; memcpy(&gd16, graw, 2);
+                    uint16_t gdm16; memcpy(&gdm16, graw+2, 2);
+                    fprintf(stderr, "  Expert[%d] Q4K block0: d=0x%04x dmin=0x%04x scales[0..3]=%d,%d,%d,%d\n",
+                        eid, gd16, gdm16, graw[4], graw[5], graw[6], graw[7]);
+                }
+
                 /* Down matmul — pre-quantize act_buf for Q5_K integer path */
                 if (lw->down_exps_type == GGML_TYPE_Q5_K) {
                     int act_q8k_blocks = I / Q8K_QK;
@@ -1473,6 +1518,14 @@ int main(int argc, char** argv) {
                     _mm256_storeu_ps(moe_out + i, _mm256_add_ps(vm, ve));
                 }
                 for (; i < H; i++) moe_out[i] += expert_out[i];
+            }
+
+            /* Dump MoE output for layer 0 tok 0 */
+            if (tok == 0 && layer == 0) {
+                FILE* fm = fopen("moe_out_L0.bin","wb"); if(fm){fwrite(moe_out,sizeof(float),H,fm);fclose(fm);}
+                float mrms=0; for(i=0;i<H;i++) mrms+=moe_out[i]*moe_out[i];
+                fprintf(stderr, "  MoE output L0: rms=%.4f [0..3]=%.4f %.4f %.4f %.4f\n",
+                    sqrtf(mrms/H), moe_out[0], moe_out[1], moe_out[2], moe_out[3]);
             }
 
             /* 2k. Residual add */

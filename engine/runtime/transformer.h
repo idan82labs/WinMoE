@@ -42,6 +42,7 @@ typedef struct {
     void* wv;      /* [hidden, num_kv_heads * head_dim] */
     void* wo;      /* [num_q_heads * head_dim, hidden] */
     int wq_type, wk_type, wv_type, wo_type;
+    int wq_rows, wk_rows; /* output dims for detecting GQA head config */
 
     /* Norms (FP32) */
     float* attn_norm;  /* [hidden] */

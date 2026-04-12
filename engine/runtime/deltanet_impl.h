@@ -16,21 +16,32 @@
 #include <string.h>
 #include <stdlib.h>
 
-/* DeltaNet config for Qwen3.5-397B:
- * QKV tensor [4096, 12288] = Q(2048) + K(2048) + V(8192)
- * 64 value heads × 128 value_dim, 16 key heads × 128 key_dim
- * State: 64 per-value-head matrices of [128 × 128]
- * Each KV group: 4 value heads share 1 key head (64/16=4)
- */
-#define DN_NUM_Q_HEADS 64      /* num_value_heads — output & state heads */
-#define DN_NUM_KV_GROUPS 16    /* num_key_heads — K groups */
-#define DN_HEADS_PER_GROUP 4   /* 64 / 16 */
-#define DN_HEAD_DIM 128        /* both key_head_dim and value_head_dim */
-#define DN_INNER 8192          /* 64 * 128 — value/output dimension */
-#define DN_KEY_DIM 2048        /* 16 * 128 — key/query dimension */
-#define DN_QKV_DIM 12288       /* Q(2048) + K(2048) + V(8192) */
-#define DN_GATE_DIM 8192       /* Z gate — same as inner */
-#define DN_NUM_GATES 64        /* alpha, beta: one per value head */
+/* DeltaNet config — initialized from GGUF metadata at startup.
+ * 397B: 64 value heads, 16 key heads, 128 head dim
+ * 35B:  32 value heads, 16 key heads, 128 head dim */
+static int DN_NUM_Q_HEADS = 64;     /* num_value_heads — output & state heads */
+static int DN_NUM_KV_GROUPS = 16;   /* num_key_heads — K groups */
+static int DN_HEADS_PER_GROUP = 4;  /* NUM_Q_HEADS / NUM_KV_GROUPS */
+static int DN_HEAD_DIM = 128;       /* both key_head_dim and value_head_dim */
+static int DN_INNER = 8192;         /* NUM_Q_HEADS * HEAD_DIM */
+static int DN_KEY_DIM = 2048;       /* NUM_KV_GROUPS * HEAD_DIM */
+static int DN_QKV_DIM = 12288;      /* KEY_DIM*2 + INNER */
+static int DN_GATE_DIM = 8192;      /* same as INNER */
+static int DN_NUM_GATES = 64;       /* same as NUM_Q_HEADS */
+
+static void dn_init_dims(int ssm_inner_size, int ssm_group_count, int ssm_head_dim) {
+    DN_HEAD_DIM = ssm_head_dim > 0 ? ssm_head_dim : 128;
+    DN_NUM_KV_GROUPS = ssm_group_count > 0 ? ssm_group_count : 16;
+    DN_INNER = ssm_inner_size > 0 ? ssm_inner_size : 8192;
+    DN_NUM_Q_HEADS = DN_INNER / DN_HEAD_DIM;
+    DN_HEADS_PER_GROUP = DN_NUM_Q_HEADS / DN_NUM_KV_GROUPS;
+    DN_KEY_DIM = DN_NUM_KV_GROUPS * DN_HEAD_DIM;
+    DN_QKV_DIM = DN_KEY_DIM * 2 + DN_INNER;
+    DN_GATE_DIM = DN_INNER;
+    DN_NUM_GATES = DN_NUM_Q_HEADS;
+    fprintf(stderr, "DeltaNet dims: heads=%d, kv_groups=%d, head_dim=%d, inner=%d, qkv=%d\n",
+        DN_NUM_Q_HEADS, DN_NUM_KV_GROUPS, DN_HEAD_DIM, DN_INNER, DN_QKV_DIM);
+}
 #define DN_CONV_WIDTH 4
 
 /* Per-layer DeltaNet state */
@@ -216,8 +227,8 @@ static void deltanet_forward(
     float* V = qkv + DN_KEY_DIM + DN_KEY_DIM; /* [8192] = 64 value heads × 128 */
 
     /* 3. Compute gate parameters per head */
-    float gate_decay[DN_NUM_GATES];
-    float beta[DN_NUM_GATES];
+    float* gate_decay = (float*)_malloca(DN_NUM_GATES * sizeof(float));
+    float* beta = (float*)_malloca(DN_NUM_GATES * sizeof(float));
 
     for (h = 0; h < DN_NUM_GATES; h++) {
         /* Decay: g = exp(A_log * softplus(alpha + dt_bias))
