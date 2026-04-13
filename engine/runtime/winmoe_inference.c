@@ -1171,12 +1171,14 @@ int main(int argc, char** argv) {
                             rmsnorm(k_buf + h * hd, k_buf + h * hd, lw->k_norm, hd);
                     }
 
-                    /* 4. Partial RoPE — only first rope_dim=64 of 256 dims, split-halves */
+                    /* 4. RoPE — IMROPE = NEOX split-halves for text-only models.
+                     * GGML rotates pairs (i, i+n_dims/2) for i in 0..n_dims/2-1
+                     * Frequency for pair i: 1/theta^(2i/n_dims)
+                     * NOTE: full rope_dim, not just rope_dim/4! Verify n_rot for Qwen3.5 */
                     {
-                        int rope_dim = hd / 4; /* partial_rotary_factor = 0.25 → 64 */
+                        int rope_dim = hd / 4; /* 64 — partial rotary 0.25 */
                         int half = rope_dim / 2; /* 32 */
                         float theta = cfg.rope_theta;
-                        /* Apply to Q heads */
                         for (int h = 0; h < nqh; h++) {
                             float* qh = q_std + h * hd;
                             for (int j = 0; j < half; j++) {
@@ -1188,7 +1190,6 @@ int main(int argc, char** argv) {
                                 qh[j + half] = r0 * sv + r1 * cv;
                             }
                         }
-                        /* Apply to K heads */
                         for (int h = 0; h < nkvh; h++) {
                             float* kh = k_buf + h * hd;
                             for (int j = 0; j < half; j++) {
