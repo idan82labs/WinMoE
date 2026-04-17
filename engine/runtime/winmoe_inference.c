@@ -534,6 +534,29 @@ int main(int argc, char** argv) {
         }
         if (missing == 0) fprintf(stderr, "AUDIT: All %d layers have required weights.\n", cfg.num_layers);
         else fprintf(stderr, "AUDIT: %d MISSING weights found!\n", missing);
+        /* Dump norm magnitudes for a few layers */
+        int HD_AUDIT = cfg.hidden_dim;
+        for (i = 0; i < cfg.num_layers; i += 10) {
+            float an=0, pan=0;
+            for (int j = 0; j < HD_AUDIT; j++) {
+                if (layers[i].attn_norm) an += layers[i].attn_norm[j] * layers[i].attn_norm[j];
+                if (layers[i].post_attn_norm) pan += layers[i].post_attn_norm[j] * layers[i].post_attn_norm[j];
+            }
+            fprintf(stderr, "NORM L%d: attn_norm_rms=%.4f post_attn_norm_rms=%.4f",
+                i, sqrtf(an/HD_AUDIT), sqrtf(pan/HD_AUDIT));
+            if (layers[i].q_norm) {
+                float qn = 0; int qd = cfg.head_dim;
+                for (int j = 0; j < qd; j++) qn += layers[i].q_norm[j] * layers[i].q_norm[j];
+                fprintf(stderr, " q_norm_rms=%.4f", sqrtf(qn/qd));
+            }
+            if (layers[i].k_norm) {
+                float kn = 0; int qd = cfg.head_dim;
+                for (int j = 0; j < qd; j++) kn += layers[i].k_norm[j] * layers[i].k_norm[j];
+                fprintf(stderr, " k_norm_rms=%.4f", sqrtf(kn/qd));
+            }
+            fprintf(stderr, "\n");
+        }
+        /* final_norm printed later, after loading */
     }
 
     /* Load embedding and LM head */
@@ -1209,8 +1232,8 @@ int main(int argc, char** argv) {
                     /* 6. GQA attention */
                     gqa_attention(attn_buf, q_std, &kv_caches[layer], nqh, nkvh, hd);
 
-                    /* DEBUG: GQA intermediate magnitudes */
-                    if (tok == 0 && layer == 3) {
+                    /* DEBUG: GQA intermediate magnitudes — dump at tok=0 AND tok=7 (late prompt) */
+                    if ((tok == 0 || tok == 7) && layer == 3) {
                         float arms = 0; for (i = 0; i < attn_dim; i++) arms += attn_buf[i]*attn_buf[i];
                         arms = sqrtf(arms / attn_dim);
                         float grms = 0; for (i = 0; i < attn_dim; i++) grms += gate_buf_std[i]*gate_buf_std[i];
@@ -1234,10 +1257,30 @@ int main(int argc, char** argv) {
                         attn_buf[i] *= sig;
                     }
 
-                    if (tok == 0 && layer == 3) {
+                    if ((tok == 0 || tok == 7) && layer == 3) {
                         float arms2 = 0; for (i = 0; i < attn_dim; i++) arms2 += attn_buf[i]*attn_buf[i];
                         arms2 = sqrtf(arms2 / attn_dim);
-                        fprintf(stderr, "  GQA L3: attn_post_gate=%.4f\n", arms2);
+                        fprintf(stderr, "  GQA L3[tok=%d]: attn_post_gate=%.4f seq_len=%d\n", tok, arms2, kv_caches[layer].len);
+                        /* For tok=7: check attention peakedness by computing scores for head 0 */
+                        if (tok == 7) {
+                            int hd2 = hd;
+                            float sc = 1.0f / sqrtf((float)hd2);
+                            float* q_head0 = q_std;
+                            float max_score = -1e30f, min_score = 1e30f;
+                            float scores_dump[20];
+                            int seq_len = kv_caches[layer].len;
+                            for (int t = 0; t < seq_len && t < 20; t++) {
+                                const float* kt = kv_caches[layer].keys + t * nkvh * hd + 0 * hd;
+                                double dot = 0.0;
+                                for (int d = 0; d < hd2; d++) dot += (double)q_head0[d] * (double)kt[d];
+                                scores_dump[t] = (float)(dot * sc);
+                                if (scores_dump[t] > max_score) max_score = scores_dump[t];
+                                if (scores_dump[t] < min_score) min_score = scores_dump[t];
+                            }
+                            fprintf(stderr, "  GQA L3 head0 scores[0..%d]: ", seq_len-1);
+                            for (int t = 0; t < seq_len && t < 8; t++) fprintf(stderr, "%.3f ", scores_dump[t]);
+                            fprintf(stderr, "\n  GQA L3 score range: [%.3f, %.3f] spread=%.3f\n", min_score, max_score, max_score - min_score);
+                        }
                     }
 
                     /* 8. O projection: [attn_dim → hidden_dim] — GPU if available */
@@ -1258,6 +1301,12 @@ int main(int argc, char** argv) {
                 if (gate_buf_std) _freea(gate_buf_std);
             } else {
                 /* Standard attention layer but weights not loaded — zero output */
+            }
+
+            /* TEST: zero DeltaNet attention output to isolate */
+            static int DISABLE_DELTANET = 0; /* reverted */
+            if (DISABLE_DELTANET && lw->is_deltanet) {
+                memset(o_out, 0, H * sizeof(float));
             }
 
             /* Residual add */
@@ -1557,7 +1606,7 @@ int main(int argc, char** argv) {
             for (i = 0; i < H; i++) hidden[i] = residual[i] + moe_out[i];
 
             /* DEBUG: track hidden state magnitude per layer */
-            if (tok == 17 || (tok == 0 && layer <= 5)) { /* tok 17 = first generated token */
+            if (tok == 7 || (tok == 0 && layer <= 5)) { /* tok 7 = last prompt token */
                 float hmag = 0; for (i = 0; i < H; i++) hmag += hidden[i] * hidden[i];
                 hmag = sqrtf(hmag / H);
                 float omag = 0; for (i = 0; i < H; i++) omag += o_out[i] * o_out[i];
