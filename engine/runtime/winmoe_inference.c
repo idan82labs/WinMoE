@@ -28,6 +28,64 @@
 #include "q4k_dequant.h"
 #include "q5k_dequant.h"
 #include "q6k_dequant.h"
+
+/* ---- Layer-bisect trace dump (matches llama-trace-dump TSV format) ---- */
+static FILE* g_trace_out = NULL;
+static int   g_trace_tok = -1;
+
+static void trace_dump(const char* name, int layer, int tok, const float* buf, int n) {
+    if (!g_trace_out || tok != g_trace_tok || !buf || n <= 0) return;
+    double sum = 0.0, sqsum = 0.0, mn = 1e30, mx = -1e30;
+    /* Per-head rms for h=0..7 (if n is divisible by 128 = DN_HEAD_DIM) */
+    double head_ss[8] = {0};
+    int head_n[8] = {0};
+    for (int i = 0; i < n; i++) {
+        double v = (double)buf[i];
+        sum += v; sqsum += v*v;
+        if (v < mn) mn = v; if (v > mx) mx = v;
+        int h = i / 128;
+        if (h < 8) { head_ss[h] += v*v; head_n[h]++; }
+    }
+    double rms  = sqrt(sqsum / (double)n);
+    double mean = sum / (double)n;
+    /* NODE name-L type ne n rms mean min max first10 */
+    fprintf(g_trace_out, "NODE\t%s-%d\tf32\t%d,1,1,1\t%d\t%.8g\t%.8g\t%.8g\t%.8g\t",
+            name, layer, n, n, rms, mean, mn, mx);
+    int show = n < 10 ? n : 10;
+    for (int k = 0; k < show; k++) fprintf(g_trace_out, "%s%.8g", k == 0 ? "" : ",", (double)buf[k]);
+    /* Append per-head rms (h=0..7) when tensor is per-head-shaped (multiple of 128) */
+    if (n % 128 == 0 && n >= 1024) {
+        fprintf(g_trace_out, "\tHEAD_RMS:");
+        for (int h = 0; h < 8; h++) {
+            double hr = head_n[h] > 0 ? sqrt(head_ss[h] / head_n[h]) : 0;
+            fprintf(g_trace_out, "%s%.6g", h == 0 ? "" : ",", hr);
+        }
+        /* Also sample 4 elements from head 1 (offset 128) and head 10 (offset 1280) */
+        if (n >= 1408) {
+            fprintf(g_trace_out, "\tH1_OFF128:%.8g,%.8g,%.8g,%.8g\tH10_OFF1280:%.8g,%.8g,%.8g,%.8g",
+                (double)buf[128], (double)buf[129], (double)buf[130], (double)buf[131],
+                (double)buf[1280], (double)buf[1281], (double)buf[1282], (double)buf[1283]);
+            /* Additional samples at offsets 256, 512, 2048, 4000, 7000 to check layout */
+            if (n >= 7100) {
+                fprintf(g_trace_out, "\tOFF256:%.6g,%.6g,%.6g\tOFF512:%.6g,%.6g,%.6g\tOFF2048:%.6g,%.6g,%.6g\tOFF4000:%.6g,%.6g,%.6g\tOFF7000:%.6g,%.6g,%.6g",
+                    (double)buf[256],(double)buf[257],(double)buf[258],
+                    (double)buf[512],(double)buf[513],(double)buf[514],
+                    (double)buf[2048],(double)buf[2049],(double)buf[2050],
+                    (double)buf[4000],(double)buf[4001],(double)buf[4002],
+                    (double)buf[7000],(double)buf[7001],(double)buf[7002]);
+            }
+        }
+    }
+    fprintf(g_trace_out, "\n");
+    fflush(g_trace_out);
+}
+static void trace_dump_scalar(const char* name, int layer, int tok, float v) {
+    if (!g_trace_out || tok != g_trace_tok) return;
+    fprintf(g_trace_out, "NODE\t%s-%d\tf32\t1,1,1,1\t1\t%.8g\t%.8g\t%.8g\t%.8g\t%.8g\n",
+            name, layer, (double)v, (double)v, (double)v, (double)v, (double)v);
+    fflush(g_trace_out);
+}
+/* --------------------------------------------------------------------- */
 #include "q8_dequant.h"
 #include "gguf_parser.h"
 #include "transformer.h"
@@ -281,7 +339,23 @@ static int load_shared_weights(const char* gguf_path, GGUFModel* model,
 
             snprintf(name, 256, "blk.%d.ssm_norm.weight", l);
             t = find_tensor(model, name);
-            if (t) { layers[l].ssm_norm_w = (float*)load_tensor_data(model, t, &size); }
+            if (t) {
+                layers[l].ssm_norm_w = (float*)load_tensor_data(model, t, &size);
+                if (l == 0 && layers[l].ssm_norm_w) {
+                    int nn = (int)(t->dims[0] ? t->dims[0] : 0);
+                    double ss = 0; float mn = 1e30f, mx = -1e30f;
+                    for (int k = 0; k < nn; k++) {
+                        float v = layers[l].ssm_norm_w[k];
+                        ss += (double)v*v; if (v < mn) mn = v; if (v > mx) mx = v;
+                    }
+                    fprintf(stderr, "  SSM_NORM_W L0: dim0=%llu dim1=%llu type=%d n=%d rms=%.6f min=%.6f max=%.6f\n",
+                        (unsigned long long)t->dims[0], (unsigned long long)t->dims[1], t->type, nn,
+                        sqrtf((float)(ss/nn)), mn, mx);
+                    fprintf(stderr, "  SSM_NORM_W L0 [0..7]: %.6f %.6f %.6f %.6f %.6f %.6f %.6f %.6f\n",
+                        layers[l].ssm_norm_w[0], layers[l].ssm_norm_w[1], layers[l].ssm_norm_w[2], layers[l].ssm_norm_w[3],
+                        layers[l].ssm_norm_w[4], layers[l].ssm_norm_w[5], layers[l].ssm_norm_w[6], layers[l].ssm_norm_w[7]);
+                }
+            }
 
             snprintf(name, 256, "blk.%d.ssm_conv1d.weight", l);
             t = find_tensor(model, name);
@@ -434,6 +508,22 @@ int main(int argc, char** argv) {
 
     fprintf(stderr, "=== WinMoE Inference Engine v0.2 ===\n");
     fprintf(stderr, "Model: %s\n", gguf_path);
+
+    /* Layer-bisect trace output (for diff against llama-trace-dump) */
+    {
+        const char* trace_path = getenv("WINMOE_TRACE_OUT");
+        if (trace_path && *trace_path) {
+            g_trace_out = fopen(trace_path, "w");
+            if (g_trace_out) {
+                g_trace_tok = 8; /* last prompt token in a 9-token prompt */
+                fprintf(g_trace_out, "# winmoe trace: tok=%d (last prompt)\n", g_trace_tok);
+                fprintf(stderr, "Trace output: %s (tok=%d)\n", trace_path, g_trace_tok);
+            } else {
+                fprintf(stderr, "WARN: failed to open WINMOE_TRACE_OUT=%s\n", trace_path);
+            }
+        }
+    }
+
     fflush(stderr);
     printf("=== WinMoE Inference Engine v0.2 ===\n\n");
 
@@ -467,10 +557,31 @@ int main(int argc, char** argv) {
     /* Initialize DeltaNet dimensions from GGUF metadata */
     {
         int ssm_inner = model.ssm_inner_size > 0 ? model.ssm_inner_size : 8192;
-        int ssm_groups = 16; /* from GGUF ssm.group_count, hardcode for now */
+        int ssm_groups = model.ssm_group_count > 0 ? model.ssm_group_count : 16;
         int ssm_hd = model.ssm_state_size > 0 ? model.ssm_state_size : 128;
         dn_init_dims(ssm_inner, ssm_groups, ssm_hd);
     }
+
+    /* Reviewer's Phase-1 check: assert known model dimensions */
+    fprintf(stderr, "\n=== MODEL DIMS (from GGUF) ===\n");
+    fprintf(stderr, "  hidden=%d num_layers=%d experts=%d top_k=%d\n",
+        cfg.hidden_dim, cfg.num_layers, cfg.num_experts, cfg.expert_k);
+    fprintf(stderr, "  moe_intermediate=%d shared_intermediate=%d\n",
+        model.expert_intermediate, model.feed_forward_length);
+    fprintf(stderr, "  head_count=%d head_count_kv=%d key_length/head_dim=%d\n",
+        model.head_count, model.head_count_kv, cfg.head_dim);
+    fprintf(stderr, "  ssm.inner=%d ssm.group_count=%d ssm.state_size=%d\n",
+        model.ssm_inner_size, model.ssm_group_count, model.ssm_state_size);
+    /* Sanity check: 397B should be (4096, 60, 512, 10, 1024, 1024, 32, 2, 256, 8192, 16, 128)
+     *               35B  should be (2048, 40, 256, 8,  512,  512,  16, 2, 256, 4096, 16, 128) */
+    if (cfg.num_experts == 512 && cfg.num_layers == 60) {
+        fprintf(stderr, "  MATCH: Qwen3.5-397B config\n");
+    } else if (cfg.num_experts == 256 && cfg.num_layers == 40) {
+        fprintf(stderr, "  MATCH: Qwen3.5-35B config\n");
+    } else {
+        fprintf(stderr, "  WARNING: unexpected config!\n");
+    }
+    fprintf(stderr, "===\n\n");
 
     printf("Model: %s\n", gguf_path);
     printf("Config: hidden=%d, intermediate=%d, layers=%d\n",
@@ -874,6 +985,8 @@ int main(int argc, char** argv) {
                 if (tok == 0) fprintf(stderr, "WARNING: L%d has NO attn_norm! Using raw hidden.\n", layer);
                 memcpy(normed, hidden, H * sizeof(float));
             }
+            trace_dump("layer_input", layer, tok, hidden, H);
+            trace_dump("attn_norm",   layer, tok, normed, H);
 
             /* 2b-g. Attention — dispatch DeltaNet or standard GQA */
             QueryPerformanceCounter(&prof_t0);
@@ -933,6 +1046,14 @@ int main(int argc, char** argv) {
                     float* gpu_qkv = gpu_get_qkv_out(slot_idx);
                     float* gpu_gate = gpu_get_gate_out(slot_idx);
 
+                    /* DIAG: optionally override GPU output with CPU matmul to test GPU kernel correctness */
+                    static int dn_force_cpu = -1;
+                    if (dn_force_cpu < 0) dn_force_cpu = getenv("WINMOE_DN_CPU") ? 1 : 0;
+                    if (dn_force_cpu) {
+                        if (lw->w_qkv) quant_matvec(gpu_qkv, lw->w_qkv, normed, DN_QKV_DIM, H, lw->w_qkv_type);
+                        if (lw->w_attn_gate) quant_matvec(gpu_gate, lw->w_attn_gate, normed, DN_INNER, H, lw->w_attn_gate_type);
+                    }
+
                     /* L0 debug: print values at each stage */
                     if (tok == 0 && layer == 0 && lw->ssm_conv1d_w) {
                         /* Test both weight layouts to determine which is correct */
@@ -968,8 +1089,8 @@ int main(int argc, char** argv) {
                                 /* ggml convention: k=0 → oldest, k=d_conv-1 → newest */
                                 sum += lw->ssm_conv1d_w[i * DN_CONV_WIDTH + k] * ds->conv_buf[hs * DN_QKV_DIM + i];
                             }
-                            float sig = 1.0f / (1.0f + expf(-sum));
-                            gpu_qkv[i] = sum * sig; /* SiLU */
+                            /* Stable SiLU: x * sigmoid(x), sigmoid_stable avoids overflow */
+                            gpu_qkv[i] = sum * sigmoid_stable(sum);
                         }
                     }
 
@@ -1002,13 +1123,14 @@ int main(int argc, char** argv) {
                     float* beta_vals = (float*)_malloca(DN_NUM_GATES * sizeof(float));
                     int hi;
                     for (hi = 0; hi < DN_NUM_GATES; hi++) {
+                        /* Stable softplus: log1p(exp(-|x|)) + max(x,0) avoids overflow at large x */
                         float a_val = (lw->ssm_a && lw->ssm_dt_bias) ?
-                            expf(lw->ssm_a[hi] * (logf(1.0f + expf(alpha_raw[hi] + lw->ssm_dt_bias[hi])))) : 0.99f;
+                            expf(lw->ssm_a[hi] * softplus_stable(alpha_raw[hi] + lw->ssm_dt_bias[hi])) : 0.99f;
                         if (a_val > 1.0f) a_val = 1.0f;
                         if (a_val < 0.0f) a_val = 0.0f;
                         if (_isnan(a_val)) a_val = 0.99f;
                         gate_decay[hi] = a_val;
-                        beta_vals[hi] = 1.0f / (1.0f + expf(-beta_raw[hi]));
+                        beta_vals[hi] = sigmoid_stable(beta_raw[hi]);
                     }
 
                     /* L2 normalize Q (16 key heads) and K (16 key heads) */
@@ -1022,7 +1144,7 @@ int main(int argc, char** argv) {
                     int h_idx, g_idx, d_idx, d2_idx;
 
                     for (h_idx = 0; h_idx < DN_NUM_Q_HEADS; h_idx++) {
-                        g_idx = h_idx / DN_HEADS_PER_GROUP; /* GROUPED order — matches this GGUF */
+                        g_idx = h_idx % DN_NUM_KV_GROUPS; /* INTERLEAVED — matches llama.cpp ggml_repeat_4d */
                         float* S = dn_states[layer].S + h_idx * DN_HEAD_DIM * DN_HEAD_DIM;
                         float* k = K_ptr + g_idx * DN_HEAD_DIM;  /* shared K from key group */
                         float* v = V_ptr + h_idx * DN_HEAD_DIM;  /* per-value-head V */
@@ -1093,6 +1215,10 @@ int main(int argc, char** argv) {
                             sqrtf(head_output[0]*head_output[0]), 0.0f, 0.0f);
                     }
 
+                    /* Trace: attn_output (head_output before per-head rmsnorm, llama.cpp's attn_output) */
+                    trace_dump("attn_output", layer, tok, head_output, DN_INNER);
+                    trace_dump("z", layer, tok, gpu_gate, DN_INNER);
+
                     float* gated_out = dn_states[layer].tmp_gated;
                     for (hi = 0; hi < DN_NUM_Q_HEADS; hi++) {
                         if (lw->ssm_norm_w)
@@ -1101,12 +1227,16 @@ int main(int argc, char** argv) {
                         else
                             dn_rmsnorm_simple(normed_out + hi * DN_HEAD_DIM, head_output + hi * DN_HEAD_DIM, DN_HEAD_DIM);
                     }
+                    /* Trace: head_output after per-head RMSNorm (pre-silu-gate) */
+                    trace_dump("attn_out_normed", layer, tok, normed_out, DN_INNER);
                     for (hi = 0; hi < DN_INNER; hi++) {
                         float zv = gpu_gate[hi];
                         if (zv > 88.0f) zv = 88.0f;
                         if (zv < -88.0f) zv = -88.0f;
                         gated_out[hi] = normed_out[hi] * (zv / (1.0f + expf(-zv)));
                     }
+                    /* Trace: final_output = normed * silu(z), input to ssm_out projection */
+                    trace_dump("final_output", layer, tok, gated_out, DN_INNER);
 
                     if (tok == 0 && layer == 0) {
                         float hr = 0; for (i = 0; i < DN_INNER; i++) hr += head_output[i]*head_output[i];
@@ -1167,7 +1297,9 @@ int main(int argc, char** argv) {
 
                 if (q_gate_buf && k_buf && v_buf && attn_buf && gate_buf_std) {
                     /* 1. Q+Gate, K, V projections — GPU if available, else CPU */
-                    int gpu_proj = use_gpu ? gpu_gqa_projections(layer, normed, H,
+                    /* DIAG: force CPU path via env var to isolate GPU kernel issues */
+                    int force_cpu_gqa = getenv("WINMOE_GQA_CPU") != NULL;
+                    int gpu_proj = (use_gpu && !force_cpu_gqa) ? gpu_gqa_projections(layer, normed, H,
                         q_gate_buf, q_out_dim, k_buf, kv_out_dim, v_buf, kv_out_dim) : -1;
                     if (gpu_proj != 0) {
                         /* CPU fallback */
@@ -1176,6 +1308,9 @@ int main(int argc, char** argv) {
                         quant_matvec(v_buf, lw->wv, normed, kv_out_dim, H, lw->wv_type);
                     }
 
+                    /* Trace: raw Q+Gate projection output before deinterleave */
+                    trace_dump("Qcur_full", layer, tok, q_gate_buf, q_out_dim);
+
                     /* 2. Deinterleave Q and Gate from doubled output */
                     /* Layout: [Q_h0(hd), Gate_h0(hd), Q_h1(hd), Gate_h1(hd), ...] */
                     float* q_std = q;  /* reuse pre-allocated q buffer */
@@ -1183,6 +1318,8 @@ int main(int argc, char** argv) {
                         memcpy(q_std + h * hd, q_gate_buf + h * hd * 2, hd * sizeof(float));
                         memcpy(gate_buf_std + h * hd, q_gate_buf + h * hd * 2 + hd, hd * sizeof(float));
                     }
+                    trace_dump("Qcur_reshaped", layer, tok, q_std, attn_dim);
+                    trace_dump("gate_reshaped", layer, tok, gate_buf_std, attn_dim);
 
                     /* 3. QK RMSNorm (per-head, before RoPE) */
                     if (lw->q_norm) {
@@ -1232,6 +1369,9 @@ int main(int argc, char** argv) {
                     /* 6. GQA attention */
                     gqa_attention(attn_buf, q_std, &kv_caches[layer], nqh, nkvh, hd);
 
+                    /* Trace: attn_pregate = attention output BEFORE sigmoid gate mul */
+                    trace_dump("attn_pregate", layer, tok, attn_buf, attn_dim);
+
                     /* DEBUG: GQA intermediate magnitudes — dump at tok=0 AND tok=7 (late prompt) */
                     if ((tok == 0 || tok == 7) && layer == 3) {
                         float arms = 0; for (i = 0; i < attn_dim; i++) arms += attn_buf[i]*attn_buf[i];
@@ -1250,12 +1390,26 @@ int main(int argc, char** argv) {
                             q_out_dim, kv_out_dim, attn_dim, hd, nqh, nkvh);
                     }
 
-                    /* 7. Sigmoid output gating: attn_out *= sigmoid(gate) */
+                    /* 7. Sigmoid output gating: attn_out *= sigmoid(gate) — stable */
+                    /* Compute gate_sigmoid into a temp buffer for tracing */
+                    {
+                        /* Emit gate_sigmoid as a tensor too (only if tracing) */
+                        if (g_trace_out && tok == g_trace_tok) {
+                            float* gs_buf = (float*)_malloca(attn_dim * sizeof(float));
+                            if (gs_buf) {
+                                for (i = 0; i < attn_dim; i++) gs_buf[i] = sigmoid_stable(gate_buf_std[i]);
+                                trace_dump("gate_sigmoid", layer, tok, gs_buf, attn_dim);
+                                _freea(gs_buf);
+                            }
+                        }
+                    }
                     for (i = 0; i < attn_dim; i++) {
                         float g = gate_buf_std[i];
-                        float sig = 1.0f / (1.0f + expf(-g));
+                        float sig = sigmoid_stable(g);
                         attn_buf[i] *= sig;
                     }
+                    /* Trace: attn_gated = attn_pregate * gate_sigmoid */
+                    trace_dump("attn_gated", layer, tok, attn_buf, attn_dim);
 
                     if ((tok == 0 || tok == 7) && layer == 3) {
                         float arms2 = 0; for (i = 0; i < attn_dim; i++) arms2 += attn_buf[i]*attn_buf[i];
@@ -1284,7 +1438,7 @@ int main(int argc, char** argv) {
                     }
 
                     /* 8. O projection: [attn_dim → hidden_dim] — GPU if available */
-                    if (!use_gpu || gpu_gqa_output(layer, attn_buf, attn_dim, o_out, H) != 0)
+                    if (!use_gpu || force_cpu_gqa || gpu_gqa_output(layer, attn_buf, attn_dim, o_out, H) != 0)
                         quant_matvec(o_out, lw->wo, attn_buf, H, attn_dim, lw->wo_type);
 
                     if (tok == 0 && layer == 3) {
@@ -1309,9 +1463,13 @@ int main(int argc, char** argv) {
                 memset(o_out, 0, H * sizeof(float));
             }
 
+            /* Trace: attn_output (= linear_attn_out for DN, attn_output for GQA) */
+            trace_dump(lw->is_deltanet ? "linear_attn_out" : "attn_output", layer, tok, o_out, H);
+
             /* Residual add */
             for (i = 0; i < H; i++) hidden[i] = residual[i] + o_out[i];
             memcpy(residual, hidden, H * sizeof(float));
+            trace_dump("attn_residual", layer, tok, hidden, H);
             QueryPerformanceCounter(&prof_t1);
             prof_attn_ms += (double)(prof_t1.QuadPart - prof_t0.QuadPart) / freq.QuadPart * 1000.0;
 
@@ -1324,6 +1482,7 @@ int main(int argc, char** argv) {
                 if (tok == 0) fprintf(stderr, "WARNING: L%d has NO post-attn norm! Using raw hidden.\n", layer);
                 memcpy(normed, hidden, H * sizeof(float));
             }
+            trace_dump("attn_post_norm", layer, tok, normed, H);
 
             /* Debug: after attention */
             if (tok == 0 && layer == 0) {
@@ -1507,11 +1666,10 @@ int main(int argc, char** argv) {
                     quant_matvec(up_buf, up_data, normed, I, H, lw->up_exps_type);
                 }
 
-                /* SwiGLU: act = silu(gate) * up — exact sigmoid */
+                /* SwiGLU: act = silu(gate) * up — stable sigmoid */
                 for (i = 0; i < I; i++) {
                     float g = gate_buf[i];
-                    float sig = 1.0f / (1.0f + expf(-g));
-                    act_buf[i] = g * sig * up_buf[i];
+                    act_buf[i] = g * sigmoid_stable(g) * up_buf[i];
                 }
 
                 /* T27: dump first CPU expert's intermediate values */
@@ -1557,32 +1715,38 @@ int main(int argc, char** argv) {
 
             if (normed_q8k) _freea(normed_q8k);
 
+            /* Trace: ffn_moe_out = routed-experts sum only (BEFORE shared expert) */
+            trace_dump("ffn_moe_out", layer, tok, moe_out, H);
+
             /* 2j-shared. Shared expert FFN (always active, added to moe_out) */
             if (lw->shexp_gate && lw->shexp_up && lw->shexp_down) {
                 /* Gate + Up projections: [hidden → intermediate] */
                 quant_matvec(gate_buf, lw->shexp_gate, normed, I, H, lw->shexp_gate_type);
                 quant_matvec(up_buf, lw->shexp_up, normed, I, H, lw->shexp_up_type);
 
-                /* SwiGLU activation — exact sigmoid */
+                /* SwiGLU activation — stable sigmoid */
                 for (i = 0; i < I; i++) {
                     float g = gate_buf[i];
-                    float sig = 1.0f / (1.0f + expf(-g));
-                    act_buf[i] = g * sig * up_buf[i];
+                    act_buf[i] = g * sigmoid_stable(g) * up_buf[i];
                 }
 
                 /* Down projection: [intermediate → hidden] */
                 quant_matvec(expert_out, lw->shexp_down, act_buf, H, I, lw->shexp_down_type);
 
-                /* Add shared expert output to moe_out (weight=1, always active) */
-                /* Apply sigmoid gating to shared expert output */
+                /* Apply sigmoid gating to shared expert output — stable */
                 if (lw->shexp_gate_inp) {
-                    /* Compute gate_scalar = dot(gate_weight, normed) — double precision */
                     double gate_scalar = 0.0;
                     for (i = 0; i < H; i++) gate_scalar += (double)lw->shexp_gate_inp[i] * (double)normed[i];
-                    /* Apply sigmoid */
-                    float sig_gate = 1.0f / (1.0f + expf(-gate_scalar));
-                    /* Scale shared expert output */
+                    float sig_gate = sigmoid_stable((float)gate_scalar);
+                    /* Dump shared expert gate distribution for diagnostics */
+                    if (tok == 0 && (layer == 0 || layer == 10 || layer == 30 || layer == 59)) {
+                        fprintf(stderr, "  SHEXP_GATE L%d: scalar=%.4f sigmoid=%.4f\n",
+                            layer, (float)gate_scalar, sig_gate);
+                    }
+                    trace_dump_scalar("shared_expert_gate",         layer, tok, (float)gate_scalar);
+                    trace_dump_scalar("shared_expert_gate_sigmoid", layer, tok, sig_gate);
                     for (i = 0; i < H; i++) expert_out[i] *= sig_gate;
+                    trace_dump("ffn_shexp_gated", layer, tok, expert_out, H);
                 }
 
                 /* Add gated shared expert output to moe_out */
@@ -1602,8 +1766,12 @@ int main(int argc, char** argv) {
                     sqrtf(mrms/H), moe_out[0], moe_out[1], moe_out[2], moe_out[3]);
             }
 
+            /* Trace: ffn_out = routed + shared (final FFN output) */
+            trace_dump("ffn_out", layer, tok, moe_out, H);
+
             /* 2k. Residual add */
             for (i = 0; i < H; i++) hidden[i] = residual[i] + moe_out[i];
+            trace_dump("l_out", layer, tok, hidden, H);
 
             /* DEBUG: track hidden state magnitude per layer */
             if (tok == 7 || (tok == 0 && layer <= 5)) { /* tok 7 = last prompt token */
@@ -1666,6 +1834,7 @@ int main(int argc, char** argv) {
         } else {
             memcpy(normed, hidden, H * sizeof(float));
         }
+        trace_dump("result_norm", -1, tok, normed, H);
 
         /* Debug: hidden state before LM head */
         if (tok <= 12) {
@@ -1731,15 +1900,43 @@ int main(int argc, char** argv) {
         }
 
         /* Debug: logit statistics */
-        if (tok == prompt_len) {
+        if (tok == prompt_len - 1 || tok == prompt_len) {
             float lmin=1e30f, lmax=-1e30f, lsum=0, lsumsq=0;
             for (int ii=0; ii<vocab_size; ii++) {
                 if (logits[ii]<lmin) lmin=logits[ii];
                 if (logits[ii]>lmax) lmax=logits[ii];
                 lsum+=logits[ii]; lsumsq+=logits[ii]*logits[ii];
             }
-            fprintf(stderr, "LOGITS: min=%.4f max=%.4f mean=%.4f std=%.4f\n",
-                lmin, lmax, lsum/vocab_size, sqrtf(lsumsq/vocab_size - (lsum/vocab_size)*(lsum/vocab_size)));
+            fprintf(stderr, "LOGITS[tok=%d]: min=%.4f max=%.4f mean=%.4f std=%.4f\n",
+                tok, lmin, lmax, lsum/vocab_size, sqrtf(lsumsq/vocab_size - (lsum/vocab_size)*(lsum/vocab_size)));
+
+            /* Trace: full logits vector stats + sentinel logits */
+            if (g_trace_out && tok == g_trace_tok) {
+                trace_dump("result_output", -1, tok, logits, vocab_size);
+                int sentinels[] = {198, 13, 846, 74455, 248045, 248046, 248068};
+                int nsent = sizeof(sentinels)/sizeof(sentinels[0]);
+                fprintf(g_trace_out, "\n# sentinel logits (tok=%d)\n", tok);
+                for (int s = 0; s < nsent; s++)
+                    fprintf(g_trace_out, "SENTINEL\t%d\t%.8g\n", sentinels[s], logits[sentinels[s]]);
+                /* top-20 */
+                int top_ids[20]; float top_vals[20];
+                for (int ii = 0; ii < 20; ii++) { top_ids[ii] = 0; top_vals[ii] = -1e30f; }
+                for (int ii = 0; ii < vocab_size; ii++) {
+                    if (logits[ii] > top_vals[19]) {
+                        top_vals[19] = logits[ii]; top_ids[19] = ii;
+                        for (int j = 18; j >= 0; j--) {
+                            if (top_vals[j+1] > top_vals[j]) {
+                                float tv = top_vals[j]; top_vals[j] = top_vals[j+1]; top_vals[j+1] = tv;
+                                int ti = top_ids[j]; top_ids[j] = top_ids[j+1]; top_ids[j+1] = ti;
+                            }
+                        }
+                    }
+                }
+                fprintf(g_trace_out, "\n# top-20 logits\n");
+                for (int k = 0; k < 20; k++)
+                    fprintf(g_trace_out, "TOP\t%d\t%d\t%.8g\n", k, top_ids[k], top_vals[k]);
+                fflush(g_trace_out);
+            }
         }
 
         /* Debug: top-10 logits + check for expected token */

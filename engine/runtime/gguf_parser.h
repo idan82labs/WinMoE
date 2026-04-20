@@ -87,6 +87,7 @@ typedef struct {
     int ssm_state_size;
     int ssm_inner_size;
     int ssm_conv_kernel;
+    int ssm_group_count;  /* num_key_heads for DeltaNet (16 for both 397B and 35B) */
     float rope_theta;
     float routed_scaling_factor;  /* MoE expert output scaling (DeepSeek/Qwen3.5 style) */
     float rms_epsilon;            /* RMSNorm epsilon (we hardcode 1e-6, model might differ) */
@@ -180,6 +181,7 @@ static int parse_gguf(const char* path, GGUFModel* model) {
             if (strstr(key, "ssm.state_size")) model->ssm_state_size = val;
             if (strstr(key, "ssm.inner_size")) model->ssm_inner_size = val;
             if (strstr(key, "ssm.conv_kernel")) model->ssm_conv_kernel = val;
+            if (strstr(key, "ssm.group_count")) model->ssm_group_count = val;
             /* Store additional useful metadata */
         } else if (vtype == 6) { /* float32 */
             float fval;

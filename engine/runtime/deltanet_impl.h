@@ -99,6 +99,21 @@ static void dn_rmsnorm_simple(float* out, const float* x, int n) {
     for (i = 0; i < n; i++) out[i] = x[i] * inv;
 }
 
+/* Numerically stable softplus: log(1+exp(x)) for all x */
+static inline float softplus_stable(float x) {
+    return log1pf(expf(-fabsf(x))) + fmaxf(x, 0.0f);
+}
+
+/* Numerically stable sigmoid: 1/(1+exp(-x)) for all x */
+static inline float sigmoid_stable(float x) {
+    if (x >= 0.0f) {
+        return 1.0f / (1.0f + expf(-x));
+    } else {
+        float z = expf(x);
+        return z / (1.0f + z);
+    }
+}
+
 /* RMS norm with learned weight */
 static void dn_rmsnorm_weighted(float* out, const float* x, const float* w, int n) {
     double ss = 0.0;
@@ -230,20 +245,19 @@ static void deltanet_forward(
     float* beta = (float*)_malloca(DN_NUM_GATES * sizeof(float));
 
     for (h = 0; h < DN_NUM_GATES; h++) {
-        /* Decay: g = exp(A_log * softplus(alpha + dt_bias))
-         * A_log is stored directly in GGUF (negative value → decay < 1)
-         * llama.cpp: gate = exp(ssm_a * softplus(alpha + dt_bias)) */
+        /* Decay: g = exp(ssm_a * softplus(alpha + dt_bias))
+         * Stable softplus: log1p(exp(-|x|)) + max(x, 0) */
         float a = (a_log && dt_bias) ?
-            expf(a_log[h] * (logf(1.0f + expf(alpha_raw[h] + dt_bias[h])))) :
+            expf(a_log[h] * softplus_stable(alpha_raw[h] + dt_bias[h])) :
             0.99f;
         /* Clamp to (0, 1] */
         if (a > 1.0f) a = 1.0f;
         if (a < 0.0f) a = 0.0f;
-        if (_isnan(a)) a = 0.99f; /* NaN guard (fp:fast safe) */
+        if (_isnan(a)) a = 0.99f;
         gate_decay[h] = a;
 
-        /* Update rate */
-        beta[h] = 1.0f / (1.0f + expf(-beta_raw[h])); /* sigmoid */
+        /* Update rate: stable sigmoid */
+        beta[h] = sigmoid_stable(beta_raw[h]);
     }
 
     /* 4. L2 normalize Q per key-head and K per key-head */

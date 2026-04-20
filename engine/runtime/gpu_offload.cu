@@ -97,6 +97,57 @@ __device__ __forceinline__ void gpu_get_scale_min(int sub, const unsigned char* 
     }
 }
 
+/* Single-thread per row kernel — absolute minimum correctness reference. */
+__global__ void q8_matvec_single_kernel(float* output, const unsigned char* weights,
+                                         const float* input, int in_dim, int out_dim) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= out_dim) return;
+    int blocks_per_row = in_dim / 32;
+    const unsigned char* row_data = weights + (long long)row * blocks_per_row * 34;
+    float total = 0.0f;
+    for (int b = 0; b < blocks_per_row; b++) {
+        const unsigned char* block = row_data + b * 34;
+        half d_h;
+        memcpy(&d_h, block, 2);
+        float d = __half2float(d_h);
+        const signed char* qs = (const signed char*)(block + 2);
+        const float* xp = input + b * 32;
+        float bs = 0.0f;
+        for (int j = 0; j < 32; j++) bs += (float)qs[j] * xp[j];
+        total += d * bs;
+    }
+    output[row] = total;
+}
+
+/* Simple Q8_0 matvec kernel — one warp per row, NO shared memory caching.
+ * Used as a correctness reference to validate the optimized kernel. */
+__global__ void q8_matvec_simple_kernel(float* output, const unsigned char* weights,
+                                         const float* input, int in_dim, int out_dim) {
+    int row = blockIdx.x;
+    if (row >= out_dim) return;
+    int tid = threadIdx.x;
+    int blocks_per_row = in_dim / 32;
+    const unsigned char* row_data = weights + (long long)row * blocks_per_row * 34;
+
+    float partial = 0.0f;
+    for (int b = tid; b < blocks_per_row; b += 32) {
+        const unsigned char* block = row_data + b * 34;
+        half d_h;
+        memcpy(&d_h, block, 2);
+        float d = __half2float(d_h);
+        const signed char* qs = (const signed char*)(block + 2);
+        const float* xp = input + b * 32;
+        float bs = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < 32; j++) bs += (float)qs[j] * xp[j];
+        partial += d * bs;
+    }
+    /* Warp reduction (32 threads) */
+    for (int offset = 16; offset > 0; offset >>= 1)
+        partial += __shfl_down_sync(0xFFFFFFFF, partial, offset);
+    if (tid == 0) output[row] = partial;
+}
+
 /* Q8_0 matvec kernel — shared memory input caching + vectorized loads */
 __global__ void q8_matvec_kernel(float* output, const unsigned char* weights,
                                   const float* input, int in_dim, int out_dim) {
@@ -707,23 +758,67 @@ extern "C" int gpu_gqa_projections(int layer,
     if (!lg->gqa_loaded) return -1;
     ensure_io_buffers(q_gate_dim > hidden_dim ? q_gate_dim : hidden_dim);
 
-    /* Upload normed input */
-    CHECK_CUDA(cudaMemcpy(d_input_fp32, normed, hidden_dim * sizeof(float), cudaMemcpyHostToDevice));
+    /* Upload normed input on the same stream as the kernel */
+    CHECK_CUDA(cudaMemcpyAsync(d_input_fp32, normed, hidden_dim * sizeof(float),
+                               cudaMemcpyHostToDevice, g_stream_compute));
 
-    /* Q+Gate projection: [hidden → q_gate_dim] */
-    q8_matvec_kernel<<<q_gate_dim, MATVEC_THREADS, hidden_dim * sizeof(float), g_stream_compute>>>(
-        d_output_fp32, (const unsigned char*)lg->d_wq, d_input_fp32, hidden_dim, q_gate_dim);
-    CHECK_CUDA(cudaMemcpy(q_gate_out, d_output_fp32, q_gate_dim * sizeof(float), cudaMemcpyDeviceToHost));
+    /* Pick kernel: 0=optimized, 1=simple (32t/row), 2=single (1t/row) */
+    static int kernel_mode = -1;
+    if (kernel_mode < 0) {
+        const char* m = getenv("WINMOE_GPU_KERNEL");
+        kernel_mode = m ? atoi(m) : 0;
+        fprintf(stderr, "GQA kernel mode: %d (%s)\n", kernel_mode,
+            kernel_mode == 0 ? "OPTIMIZED" : kernel_mode == 1 ? "SIMPLE" : "SINGLE");
+    }
 
-    /* K projection: [hidden → k_dim] */
-    q8_matvec_kernel<<<k_dim, MATVEC_THREADS, hidden_dim * sizeof(float), g_stream_compute>>>(
-        d_output_fp32, (const unsigned char*)lg->d_wk, d_input_fp32, hidden_dim, k_dim);
-    CHECK_CUDA(cudaMemcpy(k_out, d_output_fp32, k_dim * sizeof(float), cudaMemcpyDeviceToHost));
+    /* Q+Gate projection */
+    if (kernel_mode == 2) {
+        int blocks = (q_gate_dim + 31) / 32;
+        q8_matvec_single_kernel<<<blocks, 32, 0, g_stream_compute>>>(
+            d_output_fp32, (const unsigned char*)lg->d_wq, d_input_fp32, hidden_dim, q_gate_dim);
+    } else if (kernel_mode == 1) {
+        q8_matvec_simple_kernel<<<q_gate_dim, 32, 0, g_stream_compute>>>(
+            d_output_fp32, (const unsigned char*)lg->d_wq, d_input_fp32, hidden_dim, q_gate_dim);
+    } else {
+        q8_matvec_kernel<<<q_gate_dim, MATVEC_THREADS, hidden_dim * sizeof(float), g_stream_compute>>>(
+            d_output_fp32, (const unsigned char*)lg->d_wq, d_input_fp32, hidden_dim, q_gate_dim);
+    }
+    /* Use cudaMemcpyAsync on the SAME stream as the kernel — guarantees ordering */
+    CHECK_CUDA(cudaMemcpyAsync(q_gate_out, d_output_fp32, q_gate_dim * sizeof(float),
+                               cudaMemcpyDeviceToHost, g_stream_compute));
+    cudaStreamSynchronize(g_stream_compute);
 
-    /* V projection: [hidden → v_dim] */
-    q8_matvec_kernel<<<v_dim, MATVEC_THREADS, hidden_dim * sizeof(float), g_stream_compute>>>(
-        d_output_fp32, (const unsigned char*)lg->d_wv, d_input_fp32, hidden_dim, v_dim);
-    CHECK_CUDA(cudaMemcpy(v_out, d_output_fp32, v_dim * sizeof(float), cudaMemcpyDeviceToHost));
+    /* K projection */
+    if (kernel_mode == 2) {
+        int blocks = (k_dim + 31) / 32;
+        q8_matvec_single_kernel<<<blocks, 32, 0, g_stream_compute>>>(
+            d_output_fp32, (const unsigned char*)lg->d_wk, d_input_fp32, hidden_dim, k_dim);
+    } else if (kernel_mode == 1) {
+        q8_matvec_simple_kernel<<<k_dim, 32, 0, g_stream_compute>>>(
+            d_output_fp32, (const unsigned char*)lg->d_wk, d_input_fp32, hidden_dim, k_dim);
+    } else {
+        q8_matvec_kernel<<<k_dim, MATVEC_THREADS, hidden_dim * sizeof(float), g_stream_compute>>>(
+            d_output_fp32, (const unsigned char*)lg->d_wk, d_input_fp32, hidden_dim, k_dim);
+    }
+    CHECK_CUDA(cudaMemcpyAsync(k_out, d_output_fp32, k_dim * sizeof(float),
+                               cudaMemcpyDeviceToHost, g_stream_compute));
+    cudaStreamSynchronize(g_stream_compute);
+
+    /* V projection */
+    if (kernel_mode == 2) {
+        int blocks = (v_dim + 31) / 32;
+        q8_matvec_single_kernel<<<blocks, 32, 0, g_stream_compute>>>(
+            d_output_fp32, (const unsigned char*)lg->d_wv, d_input_fp32, hidden_dim, v_dim);
+    } else if (kernel_mode == 1) {
+        q8_matvec_simple_kernel<<<v_dim, 32, 0, g_stream_compute>>>(
+            d_output_fp32, (const unsigned char*)lg->d_wv, d_input_fp32, hidden_dim, v_dim);
+    } else {
+        q8_matvec_kernel<<<v_dim, MATVEC_THREADS, hidden_dim * sizeof(float), g_stream_compute>>>(
+            d_output_fp32, (const unsigned char*)lg->d_wv, d_input_fp32, hidden_dim, v_dim);
+    }
+    CHECK_CUDA(cudaMemcpyAsync(v_out, d_output_fp32, v_dim * sizeof(float),
+                               cudaMemcpyDeviceToHost, g_stream_compute));
+    cudaStreamSynchronize(g_stream_compute);
 
     return 0;
 }
@@ -737,10 +832,14 @@ extern "C" int gpu_gqa_output(int layer,
     if (!lg->gqa_loaded) return -1;
     ensure_io_buffers(attn_dim > hidden_dim ? attn_dim : hidden_dim);
 
-    CHECK_CUDA(cudaMemcpy(d_input_fp32, attn_out, attn_dim * sizeof(float), cudaMemcpyHostToDevice));
+    /* Stream-matched: H2D, kernel, D2H all on g_stream_compute, then sync */
+    CHECK_CUDA(cudaMemcpyAsync(d_input_fp32, attn_out, attn_dim * sizeof(float),
+                               cudaMemcpyHostToDevice, g_stream_compute));
     q8_matvec_kernel<<<hidden_dim, MATVEC_THREADS, attn_dim * sizeof(float), g_stream_compute>>>(
         d_output_fp32, (const unsigned char*)lg->d_wo, d_input_fp32, attn_dim, hidden_dim);
-    CHECK_CUDA(cudaMemcpy(output, d_output_fp32, hidden_dim * sizeof(float), cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaMemcpyAsync(output, d_output_fp32, hidden_dim * sizeof(float),
+                               cudaMemcpyDeviceToHost, g_stream_compute));
+    cudaStreamSynchronize(g_stream_compute);
     return 0;
 }
 
