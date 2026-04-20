@@ -1967,7 +1967,12 @@ int main(int argc, char** argv) {
                 }
             }
 
+            LARGE_INTEGER lm_t0, lm_t1;
+            QueryPerformanceCounter(&lm_t0);
             quant_matvec(logits, lm_head, normed, vocab_size, H, lm_head_type);
+            QueryPerformanceCounter(&lm_t1);
+            double lm_ms = (double)(lm_t1.QuadPart - lm_t0.QuadPart) / freq.QuadPart * 1000.0;
+            if (tok >= prompt_len - 1) fprintf(stderr, "  LM_HEAD t%d: %.0f ms\n", tok, lm_ms);
         } else {
             /* LM head not loaded (too large) — use normed[0] as dummy logit */
             for (i = 0; i < vocab_size; i++) logits[i] = normed[i % H];
