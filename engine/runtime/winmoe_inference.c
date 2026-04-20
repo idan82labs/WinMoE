@@ -2044,6 +2044,12 @@ int main(int argc, char** argv) {
         /* Print token IDs to stdout for output capture */
         printf("%d ", best_token);
         fflush(stdout);
+
+        /* EOS detection: stop after generating <|im_end|> (248046) post-prompt */
+        if (tok >= prompt_len && (best_token == 248046 || best_token == 248044)) {
+            fprintf(stderr, "EOS token (%d) generated — stopping.\n", best_token);
+            break;
+        }
     }
 
     QueryPerformanceCounter(&gen_end);
