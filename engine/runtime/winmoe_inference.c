@@ -715,6 +715,17 @@ int main(int argc, char** argv) {
     int H = cfg.hidden_dim;
     int I = cfg.intermediate;
     int K = cfg.expert_k;
+    /* Optional speed/quality tradeoff: WINMOE_TOPK env var overrides */
+    {
+        const char* k_env = getenv("WINMOE_TOPK");
+        if (k_env) {
+            int new_k = atoi(k_env);
+            if (new_k >= 1 && new_k <= K) {
+                fprintf(stderr, "WINMOE_TOPK override: K=%d (was %d)\n", new_k, K);
+                K = new_k;
+            }
+        }
+    }
     int qkv_dim = cfg.num_q_heads * cfg.head_dim;
     int kv_dim = cfg.num_kv_heads * cfg.head_dim;
 
@@ -867,12 +878,23 @@ int main(int argc, char** argv) {
     /* Simple array-based cache: (layer * num_experts + expert_id) → cached data */
     /* Budget: ~20 GB = fits ~1400 full experts (gate+up+down ~14 MB each at Q4_K 397B) */
     int expert_total_size = (int)(layers[0].gate_per_expert + layers[0].up_per_expert + layers[0].down_per_expert);
-    long long cache_budget = 20LL * 1024 * 1024 * 1024; /* 20 GB */
+    long long cache_budget = 20LL * 1024 * 1024 * 1024; /* default 20 GB */
+    {
+        const char* env = getenv("WINMOE_CACHE_GB");
+        if (env) {
+            long long gb = atoll(env);
+            if (gb >= 1 && gb <= 32) cache_budget = gb * 1024LL * 1024 * 1024;
+        }
+    }
     int max_cached = (int)(cache_budget / expert_total_size);
     if (max_cached > cfg.num_layers * cfg.num_experts) max_cached = cfg.num_layers * cfg.num_experts;
 
     int total_slots = cfg.num_layers * cfg.num_experts;
     void** expert_cache = (void**)calloc(total_slots, sizeof(void*));
+    /* Reverse map for LRU: cached_keys[i] = the cache_key stored at LRU slot i (or -1) */
+    int* cached_keys = (int*)malloc(max_cached * sizeof(int));
+    for (int q = 0; q < max_cached; q++) cached_keys[q] = -1;
+    int evict_ptr = 0;  /* round-robin eviction pointer */
     int cache_hits = 0, cache_misses = 0, cache_stored = 0;
     fprintf(stderr, "Expert cache: %d slots, budget %.1f GB, expert_size=%d bytes\n",
             max_cached, (double)cache_budget / (1024*1024*1024), expert_total_size);
@@ -1624,12 +1646,22 @@ int main(int argc, char** argv) {
                         gate_data = slot;
                         up_data = (char*)slot + lw->gate_per_expert;
                         down_data = (char*)slot + lw->gate_per_expert + lw->up_per_expert;
-                        /* Cache if budget allows, else free after use */
+                        /* Cache with round-robin eviction (LRU approximation) */
                         if (cache_stored < max_cached) {
                             expert_cache[cache_key] = slot;
+                            cached_keys[cache_stored] = cache_key;
                             cache_stored++;
+                        } else {
+                            /* Evict round-robin: free the slot at evict_ptr, replace with new */
+                            int victim_key = cached_keys[evict_ptr];
+                            if (victim_key >= 0 && expert_cache[victim_key]) {
+                                free(expert_cache[victim_key]);
+                                expert_cache[victim_key] = NULL;
+                            }
+                            expert_cache[cache_key] = slot;
+                            cached_keys[evict_ptr] = cache_key;
+                            evict_ptr = (evict_ptr + 1) % max_cached;
                         }
-                        /* If not cached, slot will leak (bounded: K*layers per token) */
                     } else {
                         /* malloc failed — zero output for this expert */
                         gate_data = up_data = down_data = expert_buf; /* will produce garbage but won't crash */
