@@ -899,6 +899,23 @@ int main(int argc, char** argv) {
     fprintf(stderr, "Expert cache: %d slots, budget %.1f GB, expert_size=%d bytes\n",
             max_cached, (double)cache_budget / (1024*1024*1024), expert_total_size);
 
+    /* Reusable IO buffer pool: 16 sets × 3 aligned buffers (gate/up/down).
+     * 16 covers the max K=10 with headroom. Allocated once, reused across all
+     * miss reads — eliminates per-miss aligned_malloc churn. */
+    void* io_pool[16][3] = {0};
+    {
+        int got_all = 1;
+        for (int q = 0; q < 16; q++) {
+            io_pool[q][0] = _aligned_malloc(expert_buf_size, ALIGN);
+            io_pool[q][1] = _aligned_malloc(expert_buf_size, ALIGN);
+            io_pool[q][2] = _aligned_malloc(expert_buf_size, ALIGN);
+            if (!io_pool[q][0] || !io_pool[q][1] || !io_pool[q][2]) got_all = 0;
+        }
+        fprintf(stderr, "IO buffer pool: %d slots × 3 × %d bytes = %.1f MB %s\n",
+            16, expert_buf_size, 16.0 * 3.0 * expert_buf_size / (1024.0*1024.0),
+            got_all ? "OK" : "PARTIAL");
+    }
+
     /* === TOKEN GENERATION LOOP === */
     LARGE_INTEGER freq, gen_start, gen_end;
     QueryPerformanceFrequency(&freq);
@@ -1557,6 +1574,62 @@ int main(int argc, char** argv) {
 
             /* 2j. Expert FFN for each selected expert */
             memset(moe_out, 0, H * sizeof(float));
+
+            /* === Cross-expert async prefetch ===
+             * Phase 1: classify all K experts (GPU/RAM/miss) and issue all
+             *          miss reads concurrently so the SSD queue is deep.
+             * Phase 2: walk experts in order; for misses, wait for that
+             *          expert's IO to complete then compute.
+             * Compute time on expert N can overlap SSD IO for expert N+1. */
+            typedef struct {
+                AsyncRead ar_gate, ar_up, ar_down;
+                void* slot;
+                void* gate_io_buf;
+                void* up_io_buf;
+                void* down_io_buf;
+                int issued;       /* 1 if 3 reads were issued */
+            } PendingRead;
+            PendingRead pending[16];
+            for (int ek = 0; ek < K; ek++) {
+                pending[ek].issued = 0;
+                pending[ek].slot = NULL;
+                pending[ek].gate_io_buf = NULL;
+                pending[ek].up_io_buf = NULL;
+                pending[ek].down_io_buf = NULL;
+                int eid = expert_ids[ek];
+                int cache_key = layer * cfg.num_experts + eid;
+                /* Skip if GPU-cached or RAM-cached — no read needed */
+                int gpu_idx_pre = use_gpu ? gpu_find_cached_expert(layer, eid) : -1;
+                if (gpu_idx_pre >= 0) continue;
+                if (expert_cache[cache_key]) continue;
+                /* Need to read — allocate slot (will become cache entry); reuse pooled IO buffers */
+                pending[ek].slot = malloc(expert_total_size);
+                pending[ek].gate_io_buf = io_pool[ek][0];
+                pending[ek].up_io_buf   = io_pool[ek][1];
+                pending[ek].down_io_buf = io_pool[ek][2];
+                if (pending[ek].slot && pending[ek].gate_io_buf &&
+                    pending[ek].up_io_buf && pending[ek].down_io_buf) {
+                    uint64_t g_off = model.shard_data_starts[lw->gate_exps_shard] + lw->gate_exps_offset +
+                                     (uint64_t)eid * lw->gate_per_expert;
+                    uint64_t u_off = model.shard_data_starts[lw->up_exps_shard] + lw->up_exps_offset +
+                                     (uint64_t)eid * lw->up_per_expert;
+                    uint64_t d_off = model.shard_data_starts[lw->down_exps_shard] + lw->down_exps_offset +
+                                     (uint64_t)eid * lw->down_per_expert;
+                    async_read_start(&pending[ek].ar_gate, lw->gate_exps_shard, g_off,
+                                     pending[ek].slot, (int)lw->gate_per_expert,
+                                     pending[ek].gate_io_buf, expert_buf_size);
+                    async_read_start(&pending[ek].ar_up, lw->up_exps_shard, u_off,
+                                     (char*)pending[ek].slot + lw->gate_per_expert,
+                                     (int)lw->up_per_expert,
+                                     pending[ek].up_io_buf, expert_buf_size);
+                    async_read_start(&pending[ek].ar_down, lw->down_exps_shard, d_off,
+                                     (char*)pending[ek].slot + lw->gate_per_expert + lw->up_per_expert,
+                                     (int)lw->down_per_expert,
+                                     pending[ek].down_io_buf, expert_buf_size);
+                    pending[ek].issued = 1;
+                }
+            }
+
             for (int ek = 0; ek < K; ek++) {
                 int eid = expert_ids[ek];
 
@@ -1603,68 +1676,37 @@ int main(int argc, char** argv) {
                     down_data = (char*)cached + lw->gate_per_expert + lw->up_per_expert;
                     cache_hits++;
                 } else {
-                    /* CACHE MISS — async read all 3 concurrently (NVMe QD=3) */
-                    void* slot = malloc(expert_total_size);
+                    /* CACHE MISS — reads were issued in Phase 1, just wait for completion */
+                    if (pending[ek].issued) {
+                        async_read_wait(&pending[ek].ar_gate);
+                        async_read_wait(&pending[ek].ar_up);
+                        async_read_wait(&pending[ek].ar_down);
+                    }
+                    /* IO buffers are pooled (reused next iter) — DO NOT free */
 
-                    /* Allocate 3 aligned buffers for concurrent reads */
-                    void* gate_io_buf = _aligned_malloc(expert_buf_size, ALIGN);
-                    void* up_io_buf = _aligned_malloc(expert_buf_size, ALIGN);
-                    void* down_io_buf = _aligned_malloc(expert_buf_size, ALIGN);
-
-                    uint64_t gate_off = model.shard_data_starts[lw->gate_exps_shard] + lw->gate_exps_offset +
-                                        (uint64_t)eid * lw->gate_per_expert;
-                    uint64_t up_off = model.shard_data_starts[lw->up_exps_shard] + lw->up_exps_offset +
-                                      (uint64_t)eid * lw->up_per_expert;
-                    uint64_t down_off = model.shard_data_starts[lw->down_exps_shard] + lw->down_exps_offset +
-                                        (uint64_t)eid * lw->down_per_expert;
-
-                    /* Issue all 3 reads concurrently */
-                    AsyncRead ar_gate, ar_up, ar_down;
-                    if (gate_io_buf && slot)
-                        async_read_start(&ar_gate, lw->gate_exps_shard, gate_off,
-                                         slot, (int)lw->gate_per_expert, gate_io_buf, expert_buf_size);
-                    if (up_io_buf && slot)
-                        async_read_start(&ar_up, lw->up_exps_shard, up_off,
-                                         (char*)slot + lw->gate_per_expert, (int)lw->up_per_expert,
-                                         up_io_buf, expert_buf_size);
-                    if (down_io_buf && slot)
-                        async_read_start(&ar_down, lw->down_exps_shard, down_off,
-                                         (char*)slot + lw->gate_per_expert + lw->up_per_expert,
-                                         (int)lw->down_per_expert, down_io_buf, expert_buf_size);
-
-                    /* Wait for all 3 (they ran concurrently on NVMe) */
-                    if (gate_io_buf && slot) async_read_wait(&ar_gate);
-                    if (up_io_buf && slot) async_read_wait(&ar_up);
-                    if (down_io_buf && slot) async_read_wait(&ar_down);
-
-                    if (gate_io_buf) _aligned_free(gate_io_buf);
-                    if (up_io_buf) _aligned_free(up_io_buf);
-                    if (down_io_buf) _aligned_free(down_io_buf);
-
-                    /* Point to stable memory in slot */
-                    if (slot) {
-                        gate_data = slot;
-                        up_data = (char*)slot + lw->gate_per_expert;
-                        down_data = (char*)slot + lw->gate_per_expert + lw->up_per_expert;
+                    if (pending[ek].slot && pending[ek].issued) {
+                        gate_data = pending[ek].slot;
+                        up_data = (char*)pending[ek].slot + lw->gate_per_expert;
+                        down_data = (char*)pending[ek].slot + lw->gate_per_expert + lw->up_per_expert;
                         /* Cache with round-robin eviction (LRU approximation) */
                         if (cache_stored < max_cached) {
-                            expert_cache[cache_key] = slot;
+                            expert_cache[cache_key] = pending[ek].slot;
                             cached_keys[cache_stored] = cache_key;
                             cache_stored++;
                         } else {
-                            /* Evict round-robin: free the slot at evict_ptr, replace with new */
                             int victim_key = cached_keys[evict_ptr];
                             if (victim_key >= 0 && expert_cache[victim_key]) {
                                 free(expert_cache[victim_key]);
                                 expert_cache[victim_key] = NULL;
                             }
-                            expert_cache[cache_key] = slot;
+                            expert_cache[cache_key] = pending[ek].slot;
                             cached_keys[evict_ptr] = cache_key;
                             evict_ptr = (evict_ptr + 1) % max_cached;
                         }
                     } else {
-                        /* malloc failed — zero output for this expert */
-                        gate_data = up_data = down_data = expert_buf; /* will produce garbage but won't crash */
+                        /* malloc/issue failed — zero output for this expert */
+                        if (pending[ek].slot) free(pending[ek].slot);
+                        gate_data = up_data = down_data = expert_buf;
                     }
                     cache_misses++;
                 }
