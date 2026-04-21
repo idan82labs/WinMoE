@@ -4,3 +4,6 @@ timestamp	trial	phase	change	tok_s_endtoend	tok_s_steady	attn_ms	expert_ms	lm_he
 2026-04-21T06:27:36	T2_phase234a	phase2_3_4a	cross-stream race fixes + GPU expert LRU (200) + OMP DN	0.21	0.299	617	1755	592	28	57.3	20.8954	pass	n/a	NEUTRAL	infra enable for later trials
 2026-04-21T07:31:11	T3_vram_7900	phase3_vram	raise VRAM ceiling 7680->7900 MB (more GPU experts fit)	0.22	0.307	617	1646	601	28	57.2	21.1146	pass	n/a	KEEP	vram ceiling up, minor 1755->1646 expert gain
 2026-04-21T08:16:32	T4_avx2_lmhead	phase4b	AVX2-vectorized Q6_K LM head	0.23	0.359	601	1641	148	30	57.2	21.1146	pass	pass	KEEP	lm_head 606->148ms (4x), steady 0.299->0.359 tok/s	
+2026-04-21T09:08:16	T5_topk6	phase5_topk	K=6 (was K=10)	0.30	0.380	620	1350	197	52	54.7	21.8698	pass	FAIL	REJECT	code quality regression: stuck in _cached loop on fibonacci
+2026-04-21T10:44:05	T6_topk8	phase5_topk	K=8 (was K=10) — middle ground	0.27	0.390	607	1404	152	35	57.0	20.7536	pass	n/a	KEEP	end-to-end +28%, fib code identical to K=10
+2026-04-21T10:51:56	T7_k8_default	phase5_topk	K=8 as default (Pareto over K=10)	0.26	0.389	626	1393	148	36	57.0	20.7536	pass	n/a	PENDING	

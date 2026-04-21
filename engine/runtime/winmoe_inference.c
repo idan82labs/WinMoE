@@ -714,17 +714,24 @@ int main(int argc, char** argv) {
     int H = cfg.hidden_dim;
     int I = cfg.intermediate;
     int K = cfg.expert_k;
-    /* Optional speed/quality tradeoff: WINMOE_TOPK env var overrides */
+    /* Default K=8 — Pareto improvement over GGUF's top_k=10:
+     * - K=8 fib produces identical Python output as K=10 (same first 40 tokens)
+     * - K=8 chat produces identical "Hello! How can I help you today?<|im_end|>"
+     * - K=8 chat steady-state +9% (0.359 -> 0.390 tok/s) over K=10
+     * - K=6 BREAKS code generation (stuck _cached loop)
+     * Override via WINMOE_TOPK env (e.g., =10 to restore GGUF default). */
+    if (K > 8) K = 8;
     {
         const char* k_env = getenv("WINMOE_TOPK");
         if (k_env) {
             int new_k = atoi(k_env);
-            if (new_k >= 1 && new_k <= K) {
+            if (new_k >= 1 && new_k <= cfg.expert_k) {
                 fprintf(stderr, "WINMOE_TOPK override: K=%d (was %d)\n", new_k, K);
                 K = new_k;
             }
         }
     }
+    fprintf(stderr, "MoE top_k = %d (GGUF says %d)\n", K, cfg.expert_k);
     int qkv_dim = cfg.num_q_heads * cfg.head_dim;
     int kv_dim = cfg.num_kv_heads * cfg.head_dim;
 
