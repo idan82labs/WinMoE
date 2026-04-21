@@ -498,27 +498,26 @@ static int load_shared_weights(const char* gguf_path, GGUFModel* model,
 int main(int argc, char** argv) {
     const char* gguf_path = "D:/models/qwen35-35b-q4/Qwen3.5-35B-A3B-Q4_K_M.gguf";
     int num_tokens = 10;
+    const char* prompt_tokens_arg = NULL;  /* comma-separated token IDs (overrides default "Hello" prompt) */
 
     /* Parse args */
     int i;
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--model") == 0 && i+1 < argc) gguf_path = argv[++i];
         if (strcmp(argv[i], "--tokens") == 0 && i+1 < argc) num_tokens = atoi(argv[++i]);
+        if (strcmp(argv[i], "--prompt-tokens") == 0 && i+1 < argc) prompt_tokens_arg = argv[++i];
     }
 
     fprintf(stderr, "=== WinMoE Inference Engine v0.2 ===\n");
     fprintf(stderr, "Model: %s\n", gguf_path);
 
-    /* Layer-bisect trace output (for diff against llama-trace-dump) */
+    /* Layer-bisect trace output (for diff against llama-trace-dump). g_trace_tok
+     * is set later in main, AFTER prompt_len is parsed from --prompt-tokens. */
     {
         const char* trace_path = getenv("WINMOE_TRACE_OUT");
         if (trace_path && *trace_path) {
             g_trace_out = fopen(trace_path, "w");
-            if (g_trace_out) {
-                g_trace_tok = 8; /* last prompt token in a 9-token prompt */
-                fprintf(g_trace_out, "# winmoe trace: tok=%d (last prompt)\n", g_trace_tok);
-                fprintf(stderr, "Trace output: %s (tok=%d)\n", trace_path, g_trace_tok);
-            } else {
+            if (!g_trace_out) {
                 fprintf(stderr, "WARN: failed to open WINMOE_TRACE_OUT=%s\n", trace_path);
             }
         }
@@ -772,6 +771,11 @@ int main(int argc, char** argv) {
     /* === GPU INITIALIZATION === */
     int use_gpu = (gpu_init() == 0);
     if (use_gpu) {
+        /* Configure GPU expert cache limit (default 200, env-overridable) */
+        const char* gpu_exp_env = getenv("WINMOE_GPU_EXPERTS");
+        int gpu_exp_limit = gpu_exp_env ? atoi(gpu_exp_env) : 200;
+        gpu_set_expert_limit(gpu_exp_limit);
+
         fprintf(stderr, "Uploading DeltaNet weights to GPU...\n");
         fflush(stderr);
         for (i = 0; i < cfg.num_layers; i++) {
@@ -925,14 +929,43 @@ int main(int argc, char** argv) {
     double prof_router_ms, prof_norm_ms, prof_embed_ms;
     LARGE_INTEGER prof_t0, prof_t1;
 
-    /* Start with token ID 9707 ("Hello") — hardcoded for now */
-    /* Prompt: <|im_start|>user\nExplain quantum physics simply<|im_end|>\n<|im_start|>assistant\n<think>\n\nThe */
-    /* Prompt: <|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n
-     * CORRECT Qwen3.5 tokenizer IDs (248K vocab, NOT the old 152K Qwen2.5 IDs!) */
-    int prompt_tokens[] = {248045, 846, 198, 9419, 248046, 198, 248045, 74455, 198};
+    /* Default prompt (chat "Hello"): <|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n */
+    int prompt_tokens_default[] = {248045, 846, 198, 9419, 248046, 198, 248045, 74455, 198};
+    int prompt_tokens_buf[1024];
+    int* prompt_tokens = prompt_tokens_default;
     int prompt_len = 9;
+    if (prompt_tokens_arg) {
+        prompt_len = 0;
+        const char* p = prompt_tokens_arg;
+        while (*p && prompt_len < 1024) {
+            char* end = NULL;
+            long v = strtol(p, &end, 10);
+            if (end == p) break;
+            prompt_tokens_buf[prompt_len++] = (int)v;
+            p = end;
+            if (*p == ',') p++;
+        }
+        if (prompt_len > 0) {
+            prompt_tokens = prompt_tokens_buf;
+            fprintf(stderr, "Custom prompt: %d tokens, first 10 ids: ", prompt_len);
+            for (int q = 0; q < prompt_len && q < 10; q++) fprintf(stderr, "%d ", prompt_tokens[q]);
+            fprintf(stderr, "\n");
+        } else {
+            fprintf(stderr, "WARN: --prompt-tokens parsed 0 ids, falling back to default\n");
+            prompt_tokens = prompt_tokens_default; prompt_len = 9;
+        }
+    }
     int cur_token = prompt_tokens[0];
     int tokens_generated = 0;
+
+    /* Now that prompt_len is known, set the trace target to the last prompt position */
+    if (g_trace_out) {
+        g_trace_tok = prompt_len - 1;
+        fprintf(g_trace_out, "# winmoe trace: tok=%d (last prompt of %d-token prompt)\n",
+                g_trace_tok, prompt_len);
+        fprintf(stderr, "Trace target: tok=%d (last of %d prompt tokens)\n",
+                g_trace_tok, prompt_len);
+    }
 
     QueryPerformanceCounter(&gen_start);
 
@@ -1176,13 +1209,17 @@ int main(int argc, char** argv) {
                     for (hi = 0; hi < DN_NUM_KV_GROUPS; hi++) dn_l2norm(Q + hi * DN_HEAD_DIM, DN_HEAD_DIM);
                     for (hi = 0; hi < DN_NUM_KV_GROUPS; hi++) dn_l2norm(K_ptr + hi * DN_HEAD_DIM, DN_HEAD_DIM);
 
-                    /* State recurrence (AVX2 vectorized) */
+                    /* State recurrence (AVX2 vectorized).
+                     * OMP over heads — each head's state matrix S is independent, no race.
+                     * At OMP=2 expect ~1.8x on the per-head work. */
                     float* head_output = dn_states[layer].tmp_head_out;
                     memset(head_output, 0, DN_INNER * sizeof(float));
                     float scale = 1.0f / sqrtf((float)DN_HEAD_DIM);
-                    int h_idx, g_idx, d_idx, d2_idx;
+                    int h_idx;
 
+                    #pragma omp parallel for schedule(static)
                     for (h_idx = 0; h_idx < DN_NUM_Q_HEADS; h_idx++) {
+                        int g_idx, d_idx, d2_idx;  /* per-thread locals */
                         g_idx = h_idx % DN_NUM_KV_GROUPS; /* INTERLEAVED — matches llama.cpp ggml_repeat_4d */
                         float* S = dn_states[layer].S + h_idx * DN_HEAD_DIM * DN_HEAD_DIM;
                         float* k = K_ptr + g_idx * DN_HEAD_DIM;  /* shared K from key group */
@@ -1665,8 +1702,10 @@ int main(int argc, char** argv) {
                     /* RAM CACHE HIT */
                     gate_data = cached;
 
-                    /* Try to promote to GPU cache */
-                    if (use_gpu && gpu_expert_cache_count() < 50) {
+                    /* Try to promote to GPU cache. Limit + LRU eviction are handled
+                     * inside gpu_cache_expert itself (see gpu_set_expert_limit in
+                     * main() which reads WINMOE_GPU_EXPERTS env). */
+                    if (use_gpu) {
                         gpu_cache_expert(layer, eid,
                             cached, (int)lw->gate_per_expert,
                             (char*)cached + lw->gate_per_expert, (int)lw->up_per_expert,

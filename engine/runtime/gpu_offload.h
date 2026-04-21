@@ -91,6 +91,9 @@ int gpu_expert_batch_add(int cache_idx, int hidden_dim, int intermediate, float 
 int gpu_expert_batch_finish(float* moe_out, int hidden_dim);
 
 int gpu_expert_cache_count(void);
+/* Configure the maximum number of GPU-cached experts.
+ * Round-robin eviction takes over once the cache is full. */
+void gpu_set_expert_limit(int limit);
 
 #ifdef __cplusplus
 }

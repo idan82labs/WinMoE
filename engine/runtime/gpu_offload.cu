@@ -541,40 +541,131 @@ typedef struct {
     int layer;
     int expert_id;
     int loaded;
+    int gate_size;   /* for VRAM accounting on evict */
+    int up_size;
+    int down_size;
 } GPUExpert;
 
 static GPUExpert g_gpu_experts[MAX_GPU_EXPERTS];
 static int g_gpu_expert_count = 0;
+/* Round-robin eviction pointer (LRU approximation) — mirrors CPU expert cache.
+ * When count hits limit, we evict at evict_ptr, replace, increment. */
+static int g_gpu_evict_ptr = 0;
+/* O(1) lookup table: layer*max_experts + eid -> slot index (-1 if not cached).
+ * Allocated on first gpu_cache_expert call once we know the dimensions. */
+static int* g_gpu_lookup = NULL;
+static int g_gpu_lookup_layers = 0;
+static int g_gpu_lookup_experts = 0;
+
+static void gpu_lookup_init(int num_layers, int num_experts) {
+    if (g_gpu_lookup) return;  /* already init */
+    g_gpu_lookup_layers = num_layers;
+    g_gpu_lookup_experts = num_experts;
+    int n = num_layers * num_experts;
+    g_gpu_lookup = (int*)malloc(n * sizeof(int));
+    for (int i = 0; i < n; i++) g_gpu_lookup[i] = -1;
+}
+
+/* Effective GPU expert cache limit. Can be lowered via WINMOE_GPU_EXPERTS env
+ * (see winmoe_inference.c); clamp so we never exceed MAX_GPU_EXPERTS. */
+static int g_gpu_expert_limit = MAX_GPU_EXPERTS;
+
+/* VRAM safety threshold — don't allow gpu_cache_expert to exceed this (MB).
+ * 8192 MB on RTX 3070 Laptop - ~290 MB leaves headroom for kernels + driver.
+ * Env override via WINMOE_VRAM_CEILING_MB if tighter machines need it. */
+static float g_gpu_vram_ceiling_mb = 7900.0f;
+
+extern "C" void gpu_set_expert_limit(int limit) {
+    if (limit < 1) limit = 1;
+    if (limit > MAX_GPU_EXPERTS) limit = MAX_GPU_EXPERTS;
+    g_gpu_expert_limit = limit;
+    fprintf(stderr, "GPU expert cache: limit set to %d (MAX_GPU_EXPERTS=%d)\n",
+            g_gpu_expert_limit, MAX_GPU_EXPERTS);
+}
 
 extern "C" int gpu_cache_expert(int layer, int expert_id,
     const void* gate_data, int gate_size,
     const void* up_data, int up_size,
     const void* down_data, int down_size)
 {
-    if (g_gpu_expert_count >= MAX_GPU_EXPERTS) return -1;
-    GPUExpert* ge = &g_gpu_experts[g_gpu_expert_count];
+    /* Lazy-init lookup table on first call. Use generous bounds so we don't
+     * need to re-allocate: 80 layers × 1024 experts × 4 bytes = 320 KB. */
+    if (!g_gpu_lookup) {
+        gpu_lookup_init(80, 1024);
+    }
+    /* Clamp against layer/expert dims */
+    if (layer >= g_gpu_lookup_layers || expert_id >= g_gpu_lookup_experts) return -1;
 
+    /* VRAM safety: refuse to add if it would push VRAM over ceiling */
+    float new_mb = (gate_size + up_size + down_size) / (1024.0f * 1024.0f);
+    if (g_vram_used + new_mb > g_gpu_vram_ceiling_mb) {
+        static int warned = 0;
+        if (!warned) {
+            fprintf(stderr, "GPU VRAM ceiling hit (%.0f MB used + %.0f MB new > %.0f MB)\n",
+                    g_vram_used, new_mb, g_gpu_vram_ceiling_mb);
+            warned = 1;
+        }
+        return -1;
+    }
+
+    int slot;
+    if (g_gpu_expert_count < g_gpu_expert_limit) {
+        /* Still growing — use next free slot */
+        slot = g_gpu_expert_count;
+        g_gpu_expert_count++;
+    } else {
+        /* Cache full — evict round-robin */
+        slot = g_gpu_evict_ptr;
+        g_gpu_evict_ptr = (g_gpu_evict_ptr + 1) % g_gpu_expert_limit;
+
+        GPUExpert* old = &g_gpu_experts[slot];
+        /* Clear old lookup entry */
+        if (old->layer >= 0 && old->expert_id >= 0 &&
+            old->layer < g_gpu_lookup_layers && old->expert_id < g_gpu_lookup_experts) {
+            g_gpu_lookup[old->layer * g_gpu_lookup_experts + old->expert_id] = -1;
+        }
+        /* Free old GPU buffers */
+        if (old->d_gate) cudaFree(old->d_gate);
+        if (old->d_up) cudaFree(old->d_up);
+        if (old->d_down) cudaFree(old->d_down);
+        g_vram_used -= (old->gate_size + old->up_size + old->down_size) / (1024.0f * 1024.0f);
+    }
+
+    GPUExpert* ge = &g_gpu_experts[slot];
+
+    /* Stream-matched async H2D — same g_stream_compute as kernels to avoid
+     * cross-stream races. Single sync at end covers all three transfers. */
     CHECK_CUDA(cudaMalloc(&ge->d_gate, gate_size));
-    CHECK_CUDA(cudaMemcpy(ge->d_gate, gate_data, gate_size, cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpyAsync(ge->d_gate, gate_data, gate_size, cudaMemcpyHostToDevice, g_stream_compute));
     CHECK_CUDA(cudaMalloc(&ge->d_up, up_size));
-    CHECK_CUDA(cudaMemcpy(ge->d_up, up_data, up_size, cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpyAsync(ge->d_up, up_data, up_size, cudaMemcpyHostToDevice, g_stream_compute));
     CHECK_CUDA(cudaMalloc(&ge->d_down, down_size));
-    CHECK_CUDA(cudaMemcpy(ge->d_down, down_data, down_size, cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpyAsync(ge->d_down, down_data, down_size, cudaMemcpyHostToDevice, g_stream_compute));
+    cudaStreamSynchronize(g_stream_compute);
 
     ge->layer = layer;
     ge->expert_id = expert_id;
     ge->loaded = 1;
-    g_gpu_expert_count++;
-    g_vram_used += (gate_size + up_size + down_size) / (1024.0f * 1024.0f);
-    return g_gpu_expert_count - 1;
+    ge->gate_size = gate_size;
+    ge->up_size = up_size;
+    ge->down_size = down_size;
+    g_gpu_lookup[layer * g_gpu_lookup_experts + expert_id] = slot;
+    g_vram_used += new_mb;
+    return slot;
 }
 
 extern "C" int gpu_find_cached_expert(int layer, int expert_id) {
+    /* O(1) lookup via 2D index table (vs former O(n) linear scan). */
+    if (!g_gpu_lookup) return -1;
+    if (layer >= g_gpu_lookup_layers || expert_id >= g_gpu_lookup_experts) return -1;
+    return g_gpu_lookup[layer * g_gpu_lookup_experts + expert_id];
+#if 0
     for (int i = 0; i < g_gpu_expert_count; i++) {
         if (g_gpu_experts[i].layer == layer && g_gpu_experts[i].expert_id == expert_id)
             return i;
     }
     return -1;
+#endif
 }
 
 extern "C" int gpu_expert_ffn(int cache_idx, const float* input, int hidden_dim,
@@ -627,8 +718,9 @@ extern "C" int gpu_expert_ffn_fused(int cache_idx, const float* input, int hidde
     ensure_expert_buffers(intermediate);
     ensure_expert_io(hidden_dim > intermediate ? hidden_dim : intermediate);
 
-    /* Upload input — sync copy to dedicated expert buffer */
-    CHECK_CUDA(cudaMemcpy(d_expert_input, input, hidden_dim * sizeof(float), cudaMemcpyHostToDevice));
+    /* Stream-matched H2D — same stream as the kernels guarantees ordering */
+    CHECK_CUDA(cudaMemcpyAsync(d_expert_input, input, hidden_dim * sizeof(float),
+                               cudaMemcpyHostToDevice, g_stream_compute));
 
     /* Gate matmul — expert-optimized kernel (32 threads, full utilization) */
     q4k_expert_kernel<<<intermediate, EXPERT_THREADS, hidden_dim * sizeof(float), g_stream_compute>>>(
@@ -647,8 +739,10 @@ extern "C" int gpu_expert_ffn_fused(int cache_idx, const float* input, int hidde
     q5k_expert_kernel<<<hidden_dim, EXPERT_THREADS, intermediate * sizeof(float), g_stream_compute>>>(
         d_expert_output, (const unsigned char*)ge->d_down, d_expert_act, intermediate, hidden_dim);
 
-    /* Download output — sync copy waits for all above */
-    CHECK_CUDA(cudaMemcpy(expert_out, d_expert_output, hidden_dim * sizeof(float), cudaMemcpyDeviceToHost));
+    /* Download output on the same stream + sync — guarantees correct ordering */
+    CHECK_CUDA(cudaMemcpyAsync(expert_out, d_expert_output, hidden_dim * sizeof(float),
+                               cudaMemcpyDeviceToHost, g_stream_compute));
+    cudaStreamSynchronize(g_stream_compute);
     return 0;
 }
 
@@ -663,8 +757,9 @@ extern "C" int gpu_expert_batch_start(const float* normed, int hidden_dim) {
         cudaMalloc(&d_moe_out, hidden_dim * sizeof(float));
         d_moe_out_size = hidden_dim;
     }
-    /* Upload normed ONCE */
-    CHECK_CUDA(cudaMemcpy(d_expert_input, normed, hidden_dim * sizeof(float), cudaMemcpyHostToDevice));
+    /* Upload normed ONCE — stream-matched with kernels on g_stream_compute */
+    CHECK_CUDA(cudaMemcpyAsync(d_expert_input, normed, hidden_dim * sizeof(float),
+                               cudaMemcpyHostToDevice, g_stream_compute));
     /* Zero moe_out accumulator on GPU */
     int zblocks = (hidden_dim + 255) / 256;
     zero_kernel<<<zblocks, 256, 0, g_stream_compute>>>(d_moe_out, hidden_dim);
