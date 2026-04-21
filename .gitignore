@@ -9,6 +9,10 @@
 # Models (too large)
 *.gguf
 
+# Debug dumps from trace infrastructure (regenerated each run)
+engine/runtime/hidden_L*.bin
+engine/runtime/moe_out_L*.bin
+
 # IDE
 .vscode/
 .idea/
