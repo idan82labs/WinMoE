@@ -1,0 +1,35 @@
+{
+  "chat_wrapper": "<|im_start|>user\n{body}<|im_end|>\n<|im_start|>assistant\n",
+  "prompts": [
+    {
+      "id": 1,
+      "name": "bracket_closure",
+      "body": "Complete this config:\nconfig = {\"name\": \"server\", \"port\": 8080, \"handlers\": [",
+      "metric_focus": "nested brace/bracket/quote closure"
+    },
+    {
+      "id": 2,
+      "name": "indentation_python",
+      "body": "Complete this Python function:\ndef parse_tree(node):\n    if node.left:\n        result = parse_tree(node.left)\n        if result is None:",
+      "metric_focus": "Python indent-sensitive block structure"
+    },
+    {
+      "id": 3,
+      "name": "var_disambiguation",
+      "body": "Continue this Python function:\ndef process(items, filters, results):\n    for item in",
+      "metric_focus": "variable name disambiguation via attention to signature"
+    },
+    {
+      "id": 4,
+      "name": "operator_choice",
+      "body": "Complete this Python condition:\nif user.age",
+      "metric_focus": "operator rank ordering (>=, ==, <)"
+    },
+    {
+      "id": 5,
+      "name": "json_output",
+      "body": "Write valid JSON for a user: {\"name\":",
+      "metric_focus": "structured output quote/brace/value discipline"
+    }
+  ]
+}

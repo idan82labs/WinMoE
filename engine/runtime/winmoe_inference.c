@@ -33,6 +33,10 @@
 static FILE* g_trace_out = NULL;
 static int   g_trace_tok = -1;
 
+/* ---- Parity sprint: full-logit binary dump per position ---- */
+static FILE* g_all_logits_bin = NULL;
+static int   g_all_logits_rows = 0;
+
 static void trace_dump(const char* name, int layer, int tok, const float* buf, int n) {
     if (!g_trace_out || tok != g_trace_tok || !buf || n <= 0) return;
     double sum = 0.0, sqsum = 0.0, mn = 1e30, mx = -1e30;
@@ -519,6 +523,20 @@ int main(int argc, char** argv) {
             g_trace_out = fopen(trace_path, "w");
             if (!g_trace_out) {
                 fprintf(stderr, "WARN: failed to open WINMOE_TRACE_OUT=%s\n", trace_path);
+            }
+        }
+    }
+
+    /* Parity-sprint binary logit dump — one float32[vocab] row per generated
+     * position. Sidecar .json written at exit with metadata. */
+    {
+        const char* path = getenv("WINMOE_DUMP_ALL_LOGITS");
+        if (path && *path) {
+            g_all_logits_bin = fopen(path, "wb");
+            if (!g_all_logits_bin) {
+                fprintf(stderr, "WARN: failed to open WINMOE_DUMP_ALL_LOGITS=%s\n", path);
+            } else {
+                fprintf(stderr, "Dumping per-position logits to %s\n", path);
             }
         }
     }
@@ -2024,6 +2042,12 @@ int main(int argc, char** argv) {
             for (i = 0; i < vocab_size; i++) logits[i] = normed[i % H];
         }
 
+        /* Parity sprint: dump THIS position's logits vector to binary (float32). */
+        if (g_all_logits_bin) {
+            fwrite(logits, sizeof(float), (size_t)vocab_size, g_all_logits_bin);
+            g_all_logits_rows++;
+        }
+
         /* Debug: logit statistics */
         if (tok == prompt_len - 1 || tok == prompt_len) {
             float lmin=1e30f, lmax=-1e30f, lsum=0, lsumsq=0;
@@ -2172,6 +2196,34 @@ int main(int argc, char** argv) {
     free(layers);
     close_shard_handles(&model);
     if (use_gpu) gpu_shutdown();
+
+    /* Parity sprint: close binary logit dump + write sidecar JSON */
+    if (g_all_logits_bin) {
+        fclose(g_all_logits_bin);
+        g_all_logits_bin = NULL;
+        const char* path = getenv("WINMOE_DUMP_ALL_LOGITS");
+        if (path && *path) {
+            char sidecar[1024];
+            snprintf(sidecar, sizeof(sidecar), "%s.json", path);
+            FILE* jf = fopen(sidecar, "w");
+            if (jf) {
+                fprintf(jf, "{\n");
+                fprintf(jf, "  \"n_positions\": %d,\n", g_all_logits_rows);
+                fprintf(jf, "  \"vocab_size\": %d,\n", cfg.vocab_size);
+                fprintf(jf, "  \"dtype\": \"float32\",\n");
+                fprintf(jf, "  \"row_bytes\": %d,\n", cfg.vocab_size * 4);
+                fprintf(jf, "  \"prompt_ids\": [");
+                for (int k = 0; k < prompt_len; k++)
+                    fprintf(jf, "%s%d", k == 0 ? "" : ",", prompt_tokens[k]);
+                fprintf(jf, "],\n");
+                fprintf(jf, "  \"note\": \"WinMoE-emitted; row i = logits AFTER processing input position i\"\n");
+                fprintf(jf, "}\n");
+                fclose(jf);
+                fprintf(stderr, "Dumped %d logit rows + %s\n", g_all_logits_rows, sidecar);
+            }
+        }
+    }
+
     #undef model
     free(pmodel);
     return 0;
