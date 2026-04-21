@@ -1,5 +1,6 @@
 timestamp	trial	phase	change	tok_s_endtoend	tok_s_steady	attn_ms	expert_ms	lm_head_ms	router_ms	hit_rate	think_logit	coherent	code_ok	decision	notes
-2026-04-21T01:22:40	T0_baseline	phase0	baseline current state, no changes	0.21	0.299	629	1720	606	27	56.6	20.7754	fail	n/a	PENDING	
+2026-04-21T01:22:40	T0_baseline	phase0	baseline current state, no changes	0.21	0.299	629	1720	606	27	56.6	20.7754	fail	n/a	BASELINE	pre-optimization chat baseline
 2026-04-21T01:50:00	T1_code_baseline	phase0	fibonacci prompt 60 tok (pre-optimizations)	0.26	0.26	640	1800	606	30	51.1	20.8	pass	pass	KEEP	coherent Python: def fibonacci(n: int) -> int: docstring; model is code-capable, no Phase 1 needed
-2026-04-21T06:27:36	T2_phase234a	phase2_3_4a	cross-stream race fixes + GPU expert LRU (200) + OMP DN	0.21	0.299	617	1755	592	28	57.3	20.8954	pass	n/a	PENDING	
-2026-04-21T07:31:11	T3_vram_7900	phase3_vram	raise VRAM ceiling 7680->7900 MB (more GPU experts fit)	0.22	0.307	617	1646	601	28	57.2	21.1146	pass	n/a	PENDING	
+2026-04-21T06:27:36	T2_phase234a	phase2_3_4a	cross-stream race fixes + GPU expert LRU (200) + OMP DN	0.21	0.299	617	1755	592	28	57.3	20.8954	pass	n/a	NEUTRAL	infra enable for later trials
+2026-04-21T07:31:11	T3_vram_7900	phase3_vram	raise VRAM ceiling 7680->7900 MB (more GPU experts fit)	0.22	0.307	617	1646	601	28	57.2	21.1146	pass	n/a	KEEP	vram ceiling up, minor 1755->1646 expert gain
+2026-04-21T08:16:32	T4_avx2_lmhead	phase4b	AVX2-vectorized Q6_K LM head	0.23	0.359	601	1641	148	30	57.2	21.1146	pass	pass	KEEP	lm_head 606->148ms (4x), steady 0.299->0.359 tok/s	
