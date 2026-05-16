@@ -1,0 +1,49 @@
+[
+  {
+    "prompt_id": 1,
+    "name": "bracket_closure",
+    "parser": "python",
+    "n_gen": 100,
+    "ok": false,
+    "err": "line 1: invalid syntax",
+    "text": "\n\n</think>\n\nHere is a completed example of the configuration, assuming a typical web server structure with common request handlers:\n\n```python\nconfig = {\n    \"name\": \"server\",\n    \"port\": 8080,\n    \"handlers\": [\n        {\"path\": \"/\", \"method\": \"GET\", \"action\": \"serve_index\"},\n        {\"path\": \"/api/data\", \"method\": \"GET\", \"action\": \"fetch_data\"},\n        {\"path"
+  },
+  {
+    "prompt_id": 2,
+    "name": "indentation_python",
+    "parser": "python",
+    "n_gen": 100,
+    "ok": false,
+    "err": "line 1: invalid syntax",
+    "text": "\n\n</think>\n\nBased on the logic of a standard tree traversal (likely searching for a specific condition or validating a property like a Binary Search Tree), the code needs to handle the case where the recursive call on the left subtree returns `None` (indicating the condition wasn't met or the search failed there). If the left side yields no result, the function should proceed to check the right subtree.\n\nHere is the completed function with a standard structure for propagating results up the tree:\n\n```"
+  },
+  {
+    "prompt_id": 3,
+    "name": "var_disambiguation",
+    "parser": "python",
+    "n_gen": 100,
+    "ok": true,
+    "err": null,
+    "text": "\n\n</think>\n\nHere is a logical continuation of the function that iterates through the items, applies the provided filters, and appends matching results to the `results` list:\n\n```python\ndef process(items, filters, results):\n    for item in items:\n        # Check if the item passes all filter conditions\n        if all(f(item) for f in filters):\n            results.append(item)\n    \n    return results\n```\n\n### How it works:\n1. **"
+  },
+  {
+    "prompt_id": 4,
+    "name": "operator_choice",
+    "parser": "python",
+    "n_gen": 100,
+    "ok": true,
+    "err": null,
+    "text": "\n\n</think>\n\nTo complete this Python condition, you need to add a comparison operator and a value to check against. Since `user.age` is likely an integer, here are a few common ways to finish the statement depending on your logic:\n\n**Option 1: Check if the user is an adult (18 or older)**\n```python\nif user.age >= 18:\n    print(\"Access granted.\")\n```\n\n**Option 2: Check if the user is a"
+  },
+  {
+    "prompt_id": 5,
+    "name": "json_output",
+    "parser": "json",
+    "n_gen": 21,
+    "ok": true,
+    "err": {
+      "name": "John Doe"
+    },
+    "text": "\n\n</think>\n\n```json\n{\n  \"name\": \"John Doe\"\n}\n```<|im_end|>"
+  }
+]

@@ -47,6 +47,15 @@ static FILE* g_normed_bin = NULL;
 static int   g_normed_rows = 0;
 static int   g_normed_dim = 0;
 
+/* Phase 4.1: WINMOE_EXPERT_TRACE=path enables a (layer × expert) access counter
+ * dumped at exit. Used to identify the hot/cold expert split for selective IQ2
+ * cold-tier quantization. Bounded at 60 layers × 512 experts = 30720 slots. */
+#define EXPERT_TRACE_MAX_LAYERS 64
+#define EXPERT_TRACE_MAX_EXPERTS 1024
+static int g_expert_hits[EXPERT_TRACE_MAX_LAYERS * EXPERT_TRACE_MAX_EXPERTS] = {0};
+static int g_expert_trace_enabled = 0;
+static const char* g_expert_trace_path = NULL;
+
 static void trace_dump(const char* name, int layer, int tok, const float* buf, int n) {
     if (!g_trace_out || tok != g_trace_tok || !buf || n <= 0) return;
     double sum = 0.0, sqsum = 0.0, mn = 1e30, mx = -1e30;
@@ -573,6 +582,16 @@ int main(int argc, char** argv) {
         }
     }
 
+    /* Phase 4.1: expert access trace */
+    {
+        const char* path = getenv("WINMOE_EXPERT_TRACE");
+        if (path && *path) {
+            g_expert_trace_enabled = 1;
+            g_expert_trace_path = path;
+            fprintf(stderr, "Expert access tracing enabled, dump at exit to %s\n", path);
+        }
+    }
+
     fflush(stderr);
     printf("=== WinMoE Inference Engine v0.2 ===\n\n");
 
@@ -955,10 +974,21 @@ int main(int argc, char** argv) {
     /* Reverse map for LRU: cached_keys[i] = the cache_key stored at LRU slot i (or -1) */
     int* cached_keys = (int*)malloc(max_cached * sizeof(int));
     for (int q = 0; q < max_cached; q++) cached_keys[q] = -1;
-    int evict_ptr = 0;  /* round-robin eviction pointer */
+    int evict_ptr = 0;  /* round-robin eviction pointer (legacy) */
     int cache_hits = 0, cache_misses = 0, cache_stored = 0;
-    fprintf(stderr, "Expert cache: %d slots, budget %.1f GB, expert_size=%d bytes\n",
-            max_cached, (double)cache_budget / (1024*1024*1024), expert_total_size);
+
+    /* Phase 4.2: LFU cache eviction. WINMOE_CACHE_POLICY=lfu enables hit-frequency
+     * based eviction. Per-slot hit_count, evict argmin(hit_count) on full-cache miss.
+     * O(1) hit (via key_to_slot index), O(max_cached) miss eviction. */
+    const char* cache_policy_env = getenv("WINMOE_CACHE_POLICY");
+    int cache_policy_lfu = (cache_policy_env && (!strcmp(cache_policy_env, "lfu") || !strcmp(cache_policy_env, "LFU")));
+    int* cache_hit_counts = (int*)calloc(max_cached, sizeof(int));
+    int* key_to_slot = (int*)malloc(total_slots * sizeof(int));
+    for (int q = 0; q < total_slots; q++) key_to_slot[q] = -1;
+
+    fprintf(stderr, "Expert cache: %d slots, budget %.1f GB, expert_size=%d bytes, policy=%s\n",
+            max_cached, (double)cache_budget / (1024*1024*1024), expert_total_size,
+            cache_policy_lfu ? "LFU" : "round-robin");
 
     /* Reusable IO buffer pool: 16 sets × 3 aligned buffers (gate/up/down).
      * 16 covers the max K=10 with headroom. Allocated once, reused across all
@@ -1692,6 +1722,12 @@ int main(int argc, char** argv) {
                 pending[ek].down_io_buf = NULL;
                 int eid = expert_ids[ek];
                 int cache_key = layer * cfg.num_experts + eid;
+                /* Phase 4.1: count per-(layer,expert) accesses */
+                if (g_expert_trace_enabled
+                    && layer < EXPERT_TRACE_MAX_LAYERS
+                    && eid >= 0 && eid < EXPERT_TRACE_MAX_EXPERTS) {
+                    g_expert_hits[layer * EXPERT_TRACE_MAX_EXPERTS + eid]++;
+                }
                 /* Skip if GPU-cached or RAM-cached — no read needed */
                 int gpu_idx_pre = use_gpu ? gpu_find_cached_expert(layer, eid) : -1;
                 if (gpu_idx_pre >= 0) continue;
@@ -1771,6 +1807,11 @@ int main(int argc, char** argv) {
                     up_data = (char*)cached + lw->gate_per_expert;
                     down_data = (char*)cached + lw->gate_per_expert + lw->up_per_expert;
                     cache_hits++;
+                    /* Phase 4.2: bump LFU hit counter via key_to_slot reverse map */
+                    if (cache_policy_lfu) {
+                        int slot = key_to_slot[cache_key];
+                        if (slot >= 0 && slot < max_cached) cache_hit_counts[slot]++;
+                    }
                 } else {
                     /* CACHE MISS — reads were issued in Phase 1, just wait for completion */
                     if (pending[ek].issued) {
@@ -1784,20 +1825,43 @@ int main(int argc, char** argv) {
                         gate_data = pending[ek].slot;
                         up_data = (char*)pending[ek].slot + lw->gate_per_expert;
                         down_data = (char*)pending[ek].slot + lw->gate_per_expert + lw->up_per_expert;
-                        /* Cache with round-robin eviction (LRU approximation) */
                         if (cache_stored < max_cached) {
+                            int slot = cache_stored;
                             expert_cache[cache_key] = pending[ek].slot;
-                            cached_keys[cache_stored] = cache_key;
+                            cached_keys[slot] = cache_key;
+                            if (cache_policy_lfu) {
+                                key_to_slot[cache_key] = slot;
+                                cache_hit_counts[slot] = 1;
+                            }
                             cache_stored++;
                         } else {
-                            int victim_key = cached_keys[evict_ptr];
+                            int evict_slot;
+                            if (cache_policy_lfu) {
+                                /* Pick slot with min hit_count; tiebreak on first encountered */
+                                evict_slot = 0;
+                                int min_hits = cache_hit_counts[0];
+                                for (int s = 1; s < max_cached; s++) {
+                                    if (cache_hit_counts[s] < min_hits) {
+                                        min_hits = cache_hit_counts[s];
+                                        evict_slot = s;
+                                    }
+                                }
+                            } else {
+                                evict_slot = evict_ptr;
+                                evict_ptr = (evict_ptr + 1) % max_cached;
+                            }
+                            int victim_key = cached_keys[evict_slot];
                             if (victim_key >= 0 && expert_cache[victim_key]) {
                                 free(expert_cache[victim_key]);
                                 expert_cache[victim_key] = NULL;
+                                if (cache_policy_lfu) key_to_slot[victim_key] = -1;
                             }
                             expert_cache[cache_key] = pending[ek].slot;
-                            cached_keys[evict_ptr] = cache_key;
-                            evict_ptr = (evict_ptr + 1) % max_cached;
+                            cached_keys[evict_slot] = cache_key;
+                            if (cache_policy_lfu) {
+                                key_to_slot[cache_key] = evict_slot;
+                                cache_hit_counts[evict_slot] = 1;
+                            }
                         }
                     } else {
                         /* malloc/issue failed — zero output for this expert */
@@ -2235,6 +2299,25 @@ int main(int argc, char** argv) {
     free(layers);
     close_shard_handles(&model);
     if (use_gpu) gpu_shutdown();
+
+    /* Phase 4.1: dump per-(layer,expert) access counter for hot/cold analysis */
+    if (g_expert_trace_enabled && g_expert_trace_path) {
+        FILE* ef = fopen(g_expert_trace_path, "w");
+        if (ef) {
+            fprintf(ef, "# layer\texpert\thits\n");
+            long total = 0;
+            for (int l = 0; l < EXPERT_TRACE_MAX_LAYERS; l++) {
+                for (int e = 0; e < EXPERT_TRACE_MAX_EXPERTS; e++) {
+                    int h = g_expert_hits[l * EXPERT_TRACE_MAX_EXPERTS + e];
+                    if (h > 0) { fprintf(ef, "%d\t%d\t%d\n", l, e, h); total += h; }
+                }
+            }
+            fclose(ef);
+            fprintf(stderr, "Expert trace dumped: %ld accesses to %s\n", total, g_expert_trace_path);
+        } else {
+            fprintf(stderr, "WARN: failed to open %s for expert trace dump\n", g_expert_trace_path);
+        }
+    }
 
     /* §1.8 diagnosis: close normed dump */
     if (g_normed_bin) {

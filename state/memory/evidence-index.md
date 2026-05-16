@@ -23,6 +23,20 @@
 - `work/baseline/results_pcie.tsv` — PCIe benchmark raw data
 - `loops/io-path-loop/results.tsv` — I/O path bakeoff: 3 trials (baseline + 2 rejected candidates)
 
+### Parity sprint (v10.48)
+- `loops/parity-coding/results.tsv` — 5 prompts × {before-fix, after-fix} parity gate results
+- `loops/parity-coding/results/0[1-5]_*/` — per-prompt PNG plots (top1, top5, rank, delta) + metrics.json
+- `loops/parity-coding/results/phase2_03_var_disambiguation/` — 200-tok teacher-forced parity for prompt 3
+- `loops/parity-coding/results/phase3/phase3_results.json` — free-gen ast.parse/json.loads outcomes per prompt
+- `loops/parity-coding/harness.py` — top-k/rank/delta/KL metrics + drift plots
+- `loops/parity-coding/run_parity.py` — orchestrator (5 prompts × {llama, winmoe} × harness)
+- `loops/parity-coding/run_phase3.py` — free-gen driver + ast/json parser
+- `state/progress/session-log/002-q6k-fix-parity-sprint.md` — full session writeup
+
+### Expert-access profile (Phase 4 prep)
+- `loops/speed-coding/analyze_expert_trace.py` — hot/cold split analyzer
+- Two long-gen traces (P1, P2, 200 tok each) show 95–96% accesses concentrate in top 50% of experts — workload-stable. Output dumped to `C:/Users/idant/phase4_expert_trace_p{1,2}.tsv` (not in repo).
+
 ### Timing calibration
 - `work/timings/fits/affine_fit_ssd.json` — first SSD affine fit (alpha≈0, beta≈42µs, B≈2118 MB/s)
 - `work/timings/fits/affine_fit_pcie.json` — PCIe fit (overhead≈11µs, B≈19 GB/s pinned)
