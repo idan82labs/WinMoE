@@ -37,6 +37,16 @@ static int   g_trace_tok = -1;
 static FILE* g_all_logits_bin = NULL;
 static int   g_all_logits_rows = 0;
 
+/* §1.8 diagnosis: WINMOE_LM_SCALAR=1 forces scalar q6k_dot_block in q6k_matvec
+ * (LM head + any other q6k matvecs) so we can isolate AVX2 path as fault. */
+int g_q6k_use_scalar = 0;
+
+/* §1.8 diagnosis: WINMOE_DUMP_NORMED=path writes per-position normed[H=4096]
+ * binary so we can compare element-wise vs llama's result_norm. */
+static FILE* g_normed_bin = NULL;
+static int   g_normed_rows = 0;
+static int   g_normed_dim = 0;
+
 static void trace_dump(const char* name, int layer, int tok, const float* buf, int n) {
     if (!g_trace_out || tok != g_trace_tok || !buf || n <= 0) return;
     double sum = 0.0, sqsum = 0.0, mn = 1e30, mx = -1e30;
@@ -537,6 +547,28 @@ int main(int argc, char** argv) {
                 fprintf(stderr, "WARN: failed to open WINMOE_DUMP_ALL_LOGITS=%s\n", path);
             } else {
                 fprintf(stderr, "Dumping per-position logits to %s\n", path);
+            }
+        }
+    }
+
+    /* §1.8 diagnosis: scalar q6k path override (slow, only for parity diagnosis) */
+    {
+        const char* sc = getenv("WINMOE_LM_SCALAR");
+        if (sc && *sc && *sc != '0') {
+            g_q6k_use_scalar = 1;
+            fprintf(stderr, "WINMOE_LM_SCALAR=1 — q6k_matvec uses scalar q6k_dot_block (no AVX2)\n");
+        }
+    }
+
+    /* §1.8 diagnosis: per-position normed (post-final-RMSNorm, pre-LM-head) binary dump */
+    {
+        const char* path = getenv("WINMOE_DUMP_NORMED");
+        if (path && *path) {
+            g_normed_bin = fopen(path, "wb");
+            if (!g_normed_bin) {
+                fprintf(stderr, "WARN: failed to open WINMOE_DUMP_NORMED=%s\n", path);
+            } else {
+                fprintf(stderr, "Dumping per-position normed (post-final-norm) to %s\n", path);
             }
         }
     }
@@ -1974,6 +2006,13 @@ int main(int argc, char** argv) {
         }
         trace_dump("result_norm", -1, tok, normed, H);
 
+        /* §1.8 diagnosis: dump full normed vector for element-wise diff vs llama */
+        if (g_normed_bin) {
+            fwrite(normed, sizeof(float), (size_t)H, g_normed_bin);
+            g_normed_rows++;
+            g_normed_dim = H;
+        }
+
         /* Debug: hidden state before LM head */
         if (tok <= 12) {
             float hmax = 0; for (i = 0; i < H; i++) if (fabsf(normed[i]) > hmax) hmax = fabsf(normed[i]);
@@ -2196,6 +2235,13 @@ int main(int argc, char** argv) {
     free(layers);
     close_shard_handles(&model);
     if (use_gpu) gpu_shutdown();
+
+    /* §1.8 diagnosis: close normed dump */
+    if (g_normed_bin) {
+        fclose(g_normed_bin);
+        g_normed_bin = NULL;
+        fprintf(stderr, "Dumped %d normed rows (dim=%d)\n", g_normed_rows, g_normed_dim);
+    }
 
     /* Parity sprint: close binary logit dump + write sidecar JSON */
     if (g_all_logits_bin) {

@@ -35,17 +35,27 @@ static inline float q6k_dot_block_avx2(const block_q6_K* block, const float* y) 
     const __m256i v32 = _mm256_set1_epi32(32);
 
     for (int n = 0; n < 256; n += 128) {
-        int is = n / 16;
-        float s1f = d * (float)block->scales[is+0];
-        float s2f = d * (float)block->scales[is+2];
-        float s3f = d * (float)block->scales[is+4];
-        float s4f = d * (float)block->scales[is+6];
-        __m256 vs1 = _mm256_set1_ps(s1f);
-        __m256 vs2 = _mm256_set1_ps(s2f);
-        __m256 vs3 = _mm256_set1_ps(s3f);
-        __m256 vs4 = _mm256_set1_ps(s4f);
+        /* Q6_K layout uses 8 scales per 128-weight half, applied at 16-weight granularity.
+         * l<16 uses scales[(n/16)+{0,2,4,6}], l>=16 uses scales[(n/16)+{1,3,5,7}].
+         * Earlier code used n/16 for the whole l-range, dropping half the scales and
+         * compressing high-magnitude rows. We handle the two halves separately. */
+        int is_lo = (n / 16);
+        int is_hi = (n / 16) + 1;
+        __m256 vs1_lo = _mm256_set1_ps(d * (float)block->scales[is_lo+0]);
+        __m256 vs2_lo = _mm256_set1_ps(d * (float)block->scales[is_lo+2]);
+        __m256 vs3_lo = _mm256_set1_ps(d * (float)block->scales[is_lo+4]);
+        __m256 vs4_lo = _mm256_set1_ps(d * (float)block->scales[is_lo+6]);
+        __m256 vs1_hi = _mm256_set1_ps(d * (float)block->scales[is_hi+0]);
+        __m256 vs2_hi = _mm256_set1_ps(d * (float)block->scales[is_hi+2]);
+        __m256 vs3_hi = _mm256_set1_ps(d * (float)block->scales[is_hi+4]);
+        __m256 vs4_hi = _mm256_set1_ps(d * (float)block->scales[is_hi+6]);
 
         for (int l = 0; l < 32; l += 8) {
+            int hi = (l >= 16);
+            __m256 vs1 = hi ? vs1_hi : vs1_lo;
+            __m256 vs2 = hi ? vs2_hi : vs2_lo;
+            __m256 vs3 = hi ? vs3_hi : vs3_lo;
+            __m256 vs4 = hi ? vs4_hi : vs4_lo;
             /* Load 8 qh bytes (each byte holds 4 × 2-bit values for q1..q4) */
             __m128i qh = _mm_loadl_epi64((const __m128i*)(block->qh + l + n/4));
             __m128i qh_q1 = _mm_and_si128(qh, mask_2);
@@ -110,8 +120,11 @@ static inline float q6k_dot_block(const block_q6_K* block, const float* y) {
      * Scales: 16 int8 values, 2 per 128-block (8 per block, but interleaved) */
     for (int n = 0; n < 256; n += 128) {
         for (int l = 0; l < 32; l++) {
-            int is = n / 16;  /* scale base index */
-            /* 4 weights per (n, l) combination */
+            /* scale index: (n/16) picks the 128-half (0 or 8), (l/16) picks
+             * which of the two 16-weight sub-blocks within this half (0 or 1).
+             * Earlier `is = n/16` ignored l/16, collapsing two distinct scales
+             * into one and selectively compressing high-magnitude rows. */
+            int is = (n / 16) + (l / 16);
             int q1 = (block->ql[l + 0  + n/2] & 0xF) | (((block->qh[l + n/4] >> 0) & 3) << 4);
             int q2 = (block->ql[l + 32 + n/2] & 0xF) | (((block->qh[l + n/4] >> 2) & 3) << 4);
             int q3 = (block->ql[l + 0  + n/2] >> 4)  | (((block->qh[l + n/4] >> 4) & 3) << 4);
@@ -127,6 +140,8 @@ static inline float q6k_dot_block(const block_q6_K* block, const float* y) {
     return sum;
 }
 
+extern int g_q6k_use_scalar;  /* set by main from WINMOE_LM_SCALAR env */
+
 static inline void q6k_matvec(
     float* out, const void* W, const float* x,
     int out_dim, int in_dim
@@ -135,14 +150,27 @@ static inline void q6k_matvec(
     const block_q6_K* blocks = (const block_q6_K*)W;
 
     int row;
-    #pragma omp parallel for schedule(static) if(out_dim >= 128)
-    for (row = 0; row < out_dim; row++) {
-        float sum = 0.0f;
-        const block_q6_K* row_blocks = &blocks[row * blocks_per_row];
-        int b;
-        for (b = 0; b < blocks_per_row; b++) {
-            sum += q6k_dot_block_avx2(&row_blocks[b], &x[b * Q6K_QK]);
+    if (g_q6k_use_scalar) {
+        #pragma omp parallel for schedule(static) if(out_dim >= 128)
+        for (row = 0; row < out_dim; row++) {
+            float sum = 0.0f;
+            const block_q6_K* row_blocks = &blocks[row * blocks_per_row];
+            int b;
+            for (b = 0; b < blocks_per_row; b++) {
+                sum += q6k_dot_block(&row_blocks[b], &x[b * Q6K_QK]);
+            }
+            out[row] = sum;
         }
-        out[row] = sum;
+    } else {
+        #pragma omp parallel for schedule(static) if(out_dim >= 128)
+        for (row = 0; row < out_dim; row++) {
+            float sum = 0.0f;
+            const block_q6_K* row_blocks = &blocks[row * blocks_per_row];
+            int b;
+            for (b = 0; b < blocks_per_row; b++) {
+                sum += q6k_dot_block_avx2(&row_blocks[b], &x[b * Q6K_QK]);
+            }
+            out[row] = sum;
+        }
     }
 }
