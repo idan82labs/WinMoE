@@ -1836,6 +1836,7 @@ int main(int argc, char** argv) {
                             cache_stored++;
                         } else {
                             int evict_slot;
+                            int min_hits_for_seed = 1;
                             if (cache_policy_lfu) {
                                 /* Pick slot with min hit_count; tiebreak on first encountered */
                                 evict_slot = 0;
@@ -1846,6 +1847,10 @@ int main(int argc, char** argv) {
                                         evict_slot = s;
                                     }
                                 }
+                                /* LFU-DA: seed new arrivals at (min+1) so they survive the
+                                 * next eviction round instead of being trivially the min.
+                                 * Without this, every new miss evicts itself before being hit. */
+                                min_hits_for_seed = min_hits + 1;
                             } else {
                                 evict_slot = evict_ptr;
                                 evict_ptr = (evict_ptr + 1) % max_cached;
@@ -1860,7 +1865,7 @@ int main(int argc, char** argv) {
                             cached_keys[evict_slot] = cache_key;
                             if (cache_policy_lfu) {
                                 key_to_slot[cache_key] = evict_slot;
-                                cache_hit_counts[evict_slot] = 1;
+                                cache_hit_counts[evict_slot] = min_hits_for_seed;
                             }
                         }
                     } else {
