@@ -56,6 +56,13 @@ static int g_expert_hits[EXPERT_TRACE_MAX_LAYERS * EXPERT_TRACE_MAX_EXPERTS] = {
 static int g_expert_trace_enabled = 0;
 static const char* g_expert_trace_path = NULL;
 
+/* Phase 4.3: WINMOE_MOE_SKIP_EVERY=N skips the routed-expert MoE FFN on every
+ * Nth MoE layer (i.e., layer % N == N-1). N=2 skips half, N=3 skips a third.
+ * The shared expert still runs (cheap; ~1/4 of routed expert cost). Routing
+ * still runs (cheap; ~25 ms/token). Routed expert IO + compute are skipped.
+ * Quality impact must be verified via Phase 1 parity gate before promoting. */
+static int g_moe_skip_every = 0;
+
 static void trace_dump(const char* name, int layer, int tok, const float* buf, int n) {
     if (!g_trace_out || tok != g_trace_tok || !buf || n <= 0) return;
     double sum = 0.0, sqsum = 0.0, mn = 1e30, mx = -1e30;
@@ -589,6 +596,19 @@ int main(int argc, char** argv) {
             g_expert_trace_enabled = 1;
             g_expert_trace_path = path;
             fprintf(stderr, "Expert access tracing enabled, dump at exit to %s\n", path);
+        }
+    }
+
+    /* Phase 4.3: MoE skip-every-N */
+    {
+        const char* env = getenv("WINMOE_MOE_SKIP_EVERY");
+        if (env && *env) {
+            int n = atoi(env);
+            if (n >= 2 && n <= 60) {
+                g_moe_skip_every = n;
+                fprintf(stderr, "WINMOE_MOE_SKIP_EVERY=%d (routed MoE skipped on layers where layer%%%d == %d)\n",
+                        n, n, n - 1);
+            }
         }
     }
 
@@ -1699,6 +1719,14 @@ int main(int argc, char** argv) {
             /* 2j. Expert FFN for each selected expert */
             memset(moe_out, 0, H * sizeof(float));
 
+            /* Phase 4.3: optionally skip the routed-expert MoE on this layer */
+            int skip_routed_moe = (g_moe_skip_every >= 2 &&
+                                   (layer % g_moe_skip_every) == (g_moe_skip_every - 1));
+            if (skip_routed_moe) {
+                if (normed_q8k) _freea(normed_q8k);
+                goto skip_routed_moe_label;
+            }
+
             /* === Cross-expert async prefetch ===
              * Phase 1: classify all K experts (GPU/RAM/miss) and issue all
              *          miss reads concurrently so the SSD queue is deep.
@@ -1954,6 +1982,7 @@ int main(int argc, char** argv) {
 
             if (normed_q8k) _freea(normed_q8k);
 
+        skip_routed_moe_label:
             /* Trace: ffn_moe_out = routed-experts sum only (BEFORE shared expert) */
             trace_dump("ffn_moe_out", layer, tok, moe_out, H);
 

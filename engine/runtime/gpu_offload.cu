@@ -533,6 +533,10 @@ static int ensure_expert_io(int dim) {
 }
 
 /* === GPU Expert Cache === */
+/* v10.50 experiment: tried bumping to 500. RESULT: no benefit — VRAM ceiling
+ * (DeltaNet 5355 MB + GQA 1594 MB = 6949 MB on RTX 3070 8GB) limits actual
+ * caching to ~135 experts regardless of MAX. To grow GPU cache, must first
+ * shrink DN/GQA VRAM (via IQ2 cold quant, smaller DN state, or fewer GQA on GPU). */
 #define MAX_GPU_EXPERTS 300
 typedef struct {
     void* d_gate;    /* Q4_K gate weights on GPU */
